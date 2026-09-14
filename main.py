@@ -90,27 +90,37 @@ def env_config(key: str, default: str = "") -> str:
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
-def _validate_or_reask(key: str, base_url: str, model: str, backend: str,
-                       label: str, max_tries: int = 3) -> str:
+def _mask_key(key: str) -> str:
+    """'gsk_abcdefghijklmnopqrstuvwxyz12' -> 'gsk_ab••••••••••••zy12'
+
+    Shows enough to confirm WHAT was pasted, hides the secret itself.
+    """
+    key = (key or "").strip()
+    if len(key) <= 10:
+        return "•" * len(key)
+    return f"{key[:6]}{'•' * min(12, len(key) - 10)}{key[-4:]}"
+
+
+async def _validate_or_reask(key: str, base_url: str, model: str, backend: str,
+                             label: str, max_tries: int = 3) -> str:
     """Ping the backend with the pasted key; re-ask on failure. Returns the key."""
+    print(f"  Received: {_mask_key(key)} ({len(key)} chars — hidden for safety)")
     tries = 0
     while True:
         print(f"  Verifying {label} with a tiny test call...", flush=True)
         try:
-            async def _attempt():
-                client = LLMClient(
-                    backend=backend, api_key=key, base_url=base_url or None, model=model,
-                )
+            client = LLMClient(
+                backend=backend, api_key=key, base_url=base_url or None, model=model,
+            )
+            try:
+                await client.ping()
+            finally:
+                # close the HTTP pool inside the SAME event loop, or httpx
+                # complains 'Event loop is closed' during GC
                 try:
-                    await client.ping()
-                finally:
-                    # close the HTTP pool inside the SAME event loop, or httpx
-                    # complains 'Event loop is closed' during GC
-                    try:
-                        await client.client.close()
-                    except Exception:
-                        pass
-            asyncio.run(_attempt())
+                    await client.client.close()
+                except Exception:
+                    pass
             print("  ✓ Key works!\n")
             return key
         except (LLMAuthError, LLMConnectionError, LLMRateLimitError, LLMResponseError) as e:
@@ -123,9 +133,10 @@ def _validate_or_reask(key: str, base_url: str, model: str, backend: str,
             if not key:
                 print("  [!] No key entered — setup cancelled.")
                 sys.exit(1)
+            print(f"  Received: {_mask_key(key)} ({len(key)} chars — hidden for safety)")
 
 
-def run_setup_wizard() -> None:
+async def run_setup_wizard() -> None:
     """One-time guided setup (freebuff-style): pick a brain, paste a key, done."""
     print()
     print("=" * 58)
@@ -149,7 +160,7 @@ def run_setup_wizard() -> None:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
         model = (input("  Model [gpt-4o-mini]: ").strip() or "gpt-4o-mini")
-        key = _validate_or_reask(key, "", model, "openai", "OPENAI_API_KEY")
+        key = await _validate_or_reask(key, "", model, "openai", "OPENAI_API_KEY")
         lines = ["LLM_BACKEND=openai", f"OPENAI_API_KEY={key}", f"LLM_MODEL={model}"]
     elif choice == "4":
         key = getpass.getpass("  Paste your API key (hidden): ").strip()
@@ -158,7 +169,7 @@ def run_setup_wizard() -> None:
         if not key or not model:
             print("  [!] Key and model are required — setup cancelled.")
             sys.exit(1)
-        key = _validate_or_reask(key, base, model, "custom", "API key")
+        key = await _validate_or_reask(key, base, model, "custom", "API key")
         lines = ["LLM_BACKEND=custom", f"API_KEY={key}", f"BASE_URL={base}", f"LLM_MODEL={model}"]
     else:
         print("\n  Get a FREE key at https://console.groq.com (no credit card needed).")
@@ -167,7 +178,7 @@ def run_setup_wizard() -> None:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
         model = (input("  Model [openai/gpt-oss-20b]: ").strip() or "openai/gpt-oss-20b")
-        key = _validate_or_reask(key, GROQ_BASE_URL, model, "custom", "Groq API key")
+        key = await _validate_or_reask(key, GROQ_BASE_URL, model, "custom", "Groq API key")
         lines = [
             "LLM_BACKEND=custom",
             f"API_KEY={key}",
@@ -230,7 +241,7 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
         or os.path.exists(os.path.join(_MFOREGE_ROOT, ".env"))
     )
     if args.setup or _no_config:
-        run_setup_wizard()
+        await run_setup_wizard()
         if args.setup:  # explicit --setup: exit after saving
             return
 
