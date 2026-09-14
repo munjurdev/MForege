@@ -29,10 +29,12 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from app.agent import Agent, AgentConfig
+from app import __version__
 from app.agent.tools import CalculatorTool, TimeTool
 from app.tools import ExaSearchTool
 from app.tools.system_tools import create_system_tools, PlanState, NotifyHook
 from app.ui import ChatUI
+from app.update_check import check_for_update
 from app.llm.client import (
     LLMAuthError,
     LLMConnectionError,
@@ -254,6 +256,11 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
     # ── UI ────────────────────────────────────────────────────────────
     base_status = f"{args.model} │ {workspace}"
     ui = ChatUI(status_text=base_status)
+
+    # Upgrade banner (24h-cached PyPI check; silent on any failure)
+    update_banner = check_for_update(__version__)
+    if update_banner:
+        ui.append(update_banner, style="class:warn")
 
     # Confirmation happens in the UI question bar (async, deadlock-free:
     # tools now await async confirm callbacks on the same running loop).
