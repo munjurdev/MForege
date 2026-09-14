@@ -1,7 +1,7 @@
 # MForege — AI Agent CLI
 
-[![PyPI version](https://img.shields.io/pypi/v/mforege.svg)](https://pypi.org/project/mforege/)
-[![Python](https://img.shields.io/pypi/pyversions/mforege.svg)](https://pypi.org/project/mforege/)
+[![PyPI version](https://img.shields.io/pypi/v/mforege.svg?v=2)](https://pypi.org/project/mforege/)
+[![Python](https://img.shields.io/pypi/pyversions/mforege.svg?v=2)](https://pypi.org/project/mforege/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A command-line AI agent with a transparent, IDE-style interface: live tool
