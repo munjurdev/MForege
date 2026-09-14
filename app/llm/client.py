@@ -108,9 +108,21 @@ class LLMClient:
                 # Drop keys the backend doesn't accept (e.g., some OpenAI-
                 # compatible APIs reject tool_choice=None with tools omitted,
                 # or reject unknown params entirely)
+                # NOTE: `config` is an MForege-internal kwarg (AgentConfig);
+                # it must never reach the OpenAI SDK.
                 call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                call_kwargs.pop("config", None)
                 if "tools" in call_kwargs and call_kwargs["tools"]:
                     call_kwargs.setdefault("tool_choice", "auto")
+                # Groq reasoning models (gpt-oss etc.) only stream their
+                # thinking when asked; harmless extra_body for others.
+                if self.backend == "custom":
+                    body = dict(call_kwargs.pop("extra_body", {}) or {})
+                    body.setdefault("include_reasoning", True)
+                    effort = getattr(kwargs.get("config"), "reasoning_effort", None)
+                    if effort:
+                        body.setdefault("reasoning_effort", effort)
+                    call_kwargs["extra_body"] = body
                 return await self.client.chat.completions.create(**call_kwargs)
 
             except APITimeoutError:

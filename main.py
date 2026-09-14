@@ -29,11 +29,12 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from app.agent import Agent, AgentConfig
+from app.agent.sessions import SessionStore
 from app import __version__
 from app.agent.tools import CalculatorTool, TimeTool
 from app.tools import ExaSearchTool
 from app.tools.system_tools import create_system_tools, PlanState, NotifyHook
-from app.ui import ChatUI
+from app.ui import ChatUI, boxed
 from app.update_check import check_for_update
 from app.llm.client import (
     LLMClient,
@@ -273,25 +274,78 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
 
     notify_hook.callback = render_notify
 
-    # header
-    _pc("=" * 56)
-    _pc("MForege — your personal AI agent (plain mode)", "\033[92m\033[1m")
-    _pc(f"backend: {args.backend} │ model: {args.model}", "\033[96m")
-    _pc(f"workspace: {workspace}", "\033[96m")
+    # header — the same structured box as the full UI (uncolored inside,
+    # so the width math is exact; the whole box is printed green)
+    _pc(boxed([
+        "MForege ✦ your personal AI agent (plain mode)",
+        f"backend: {args.backend} │ model: {args.model}",
+        f"workspace: {workspace}",
+        "",
+        "Type / for commands · exit or Ctrl+C to quit.",
+    ]), "\033[92m\033[1m")
 
-    name = agent.long_term_memory.guess_name()
-    fact_count = agent.long_term_memory.count
-    if name:
-        _pc(f"Welcome back, {name}! 👋", "\033[92m")
-    elif fact_count:
-        _pc("Welcome back! 👋", "\033[92m")
-    else:
-        _pc("Nice to meet you! 👋 I'm MForege.", "\033[92m")
     if not search_tool.is_configured:
         _pc("[i] Optional: web search is off (free Exa key at dashboard.exa.ai).", COLORS_DIM)
-    _pc("Type /help for commands. exit or Ctrl+C to quit.\n", COLORS_DIM)
+    if os.environ.get("TERM_PROGRAM") == "vscode":
+        _pc("[i] VS Code: Shift+Enter needs a one-time keybinding — run /vscode-hint.", COLORS_DIM)
+        _pc("    Use Alt+Enter meanwhile.", COLORS_DIM)
+
+    # ── session persistence (resume across restarts) ───────────────
+    session_store = SessionStore()
+    session = session_store.start()
+
+    # Auto-continue: pick up the most recent chat automatically (like an
+    # agent session that survives cutoffs). Quietly skips if none exist.
+    latest = session_store.latest_id()
+    if latest:
+        stored = session_store.load(latest)
+        if stored and stored.messages:
+            agent.restore_session_messages(stored.messages)
+            session.id = stored.id
+            session.title = stored.title
+            session.messages = list(stored.messages)
+            _pc(f"[↩] Continuing your last chat ({len(stored.messages)} messages) — /clear to start fresh.", COLORS_DIM)
+
+    async def handle_sessions_command(slash, agent, session, pc) -> None:
+        """"/sessions" list · "/resume [id]" restore an old conversation."""
+        if slash == "/sessions":
+            rows = session_store.list()
+            if not rows:
+                pc("[Sessions] No saved conversations yet.", COLORS_DIM)
+                return
+            pc(f"[Sessions] Recent conversations (newest first):")
+            for r in rows:
+                pc(f"   {r['id']}  ({r['count']} msgs)  {r['title'][:44]}", COLORS_DIM)
+            pc("   → /resume <id> to continue one", COLORS_DIM)
+            return
+        # /resume [id]
+        rows = session_store.list()
+        if not rows:
+            pc("[Resume] No saved conversations to resume.", COLORS_DIM)
+            return
+        wanted = None
+        parts = slash.split(maxsplit=1)
+        if len(parts) > 1:
+            wanted = parts[1].strip()
+            target = next((r for r in rows if r["id"].startswith(wanted)), None)
+            if target is None:
+                pc(f"[Resume] No session matching '{wanted}'. Try /sessions.", "\033[91m")
+                return
+        else:
+            target = rows[0]  # most recent
+        stored = session_store.load(target["id"])
+        if stored is None or not stored.messages:
+            pc("[Resume] That session is empty.", "\033[91m")
+            return
+        agent.restore_session_messages(stored.messages)
+        session.id = stored.id            # keep appending to the same file
+        session.title = stored.title
+        session.messages = stored.messages
+        pc(f"[Resume] Restored '{stored.title}' ({len(stored.messages)} messages).", "\033[92m")
+        pc("   Context is back — just continue chatting.", COLORS_DIM)
 
     async def handle(text: str) -> None:
+        nonlocal session
         low = text.lower().strip()
         if text.startswith("/"):
             slash = text.split()[0].lower()
@@ -300,8 +354,16 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
                 for cmd, desc in [
                     ("/plan", "Show the current mission plan"),
                     ("/tools", "List registered tools"),
-                    ("/memory", "Show what MForege remembers"),
-                    ("/forget", "Wipe long-term memory"),
+                    ("/new", "Clear the conversation and start a new chat"),
+                    ("/history", "Browse and resume past conversations"),
+                    ("/sessions", "List past conversations"),
+                    ("/resume", "Resume the most recent chat"),
+                    ("/bash", "Run a shell command with the agent's safety guards"),
+                    ("/byok", "Show where to configure your API key / model"),
+                    ("/queue", "Message queueing info"),
+                    ("/interview", "Guided Q&A to spec a task before building"),
+                    ("/feedback", "Share feedback about MForege"),
+                    ("/vscode-hint", "Fix Shift+Enter for VS Code's terminal"),
                     ("/clear", "Reset conversation"),
                     ("/exit", "Quit"),
                 ]:
@@ -311,7 +373,23 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
                 rendered = plan_state.render()
                 _pc(rendered if rendered else "No active plan.", "\033[95m")
                 return
-            text = slash[1:]
+            if slash == "/vscode-hint":
+                _pc("[VS Code Shift+Enter fix] (one-time, 30 seconds):", "\033[96m")
+                _pc("  1. Ctrl+Shift+P → 'Preferences: Open Keyboard Shortcuts (JSON)'")
+                _pc("  2. Add this entry inside the [ ] array:")
+                _pc('     { "key": "shift+enter",', COLORS_DIM)
+                _pc('       "command": "workbench.action.terminal.sendSequence",', COLORS_DIM)
+                _pc('       "args": { "text": "\\u001b\\r" },', COLORS_DIM)
+                _pc('       "when": "terminalFocus" }', COLORS_DIM)
+                _pc("  3. Save, then restart VS Code completely.")
+                _pc("  → This makes VS Code send ESC+CR for Shift+Enter — which MForege")
+                _pc("    already treats as a newline. (Same fix Claude Code recommends.)")
+                return
+            if slash in ("/sessions", "/resume"):
+                await handle_sessions_command(slash, agent, session,
+                                              _pc)
+                return
+            text = text[1:]
             low = text.lower()
         if low in ("exit", "quit"):
             _pc("Goodbye! 👋", "\033[92m")
@@ -320,34 +398,80 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
             agent.clear_memory()
             _pc("[*] Conversation cleared", "\033[92m")
             return
-        if low == "memory":
-            facts = agent.long_term_memory.all()
-            if facts:
-                _pc(f"[Memory] ({len(facts)} facts):")
-                for i, f in enumerate(facts, 1):
-                    _pc(f"   {i}. {f}")
-            else:
-                _pc("[Memory] Nothing remembered yet.", COLORS_DIM)
-            return
-        if low in ("forget", "forget all", "forget everything"):
-            agent.clear_long_term_memory()
-            _pc("[*] Long-term memory wiped.", "\033[92m")
+        if low in ("memory", "forget", "forget all", "forget everything"):
+            _pc("[i] MForege keeps only conversation context now (like an agent):")
+            _pc("    auto-continues your last chat; /sessions + /resume manage history.", COLORS_DIM)
             return
         if low == "tools":
             _pc("[Tools]:")
             for t in agent.tools.list():
                 _pc(f"   - {t.name}", COLORS_DIM)
             return
+        if low == "new":
+            agent.clear_memory()
+            session = session_store.start()
+            _pc("[*] New conversation started — fresh context.", "\033[92m")
+            return
+        if low == "history":
+            rows = session_store.list()
+            if not rows:
+                _pc("[History] No saved conversations yet.", COLORS_DIM)
+                return
+            _pc("[History] Recent conversations (newest first):")
+            for r in rows:
+                _pc(f"   {r['id']}  ({r['count']} msgs)  {r['title'][:44]}", COLORS_DIM)
+            _pc("   → /resume <id> to continue one — /new to start fresh.", COLORS_DIM)
+            return
+        if low == "queue":
+            _pc("[Queue] Message queueing is not needed — MForege processes")
+            _pc("    each message immediately; send after the reply lands.", COLORS_DIM)
+            return
+        if low == "interview":
+            _pc("[Interview] Tell me your goal in one line — I'll ask targeted", "\033[96m")
+            _pc("    questions one at a time to pin down scope, constraints and", COLORS_DIM)
+            _pc("    trade-offs, then turn it into a step-by-step plan.", COLORS_DIM)
+            return
+        if low == "bash" or low.startswith("bash "):
+            parts = text.split(maxsplit=1)
+            cmd = parts[1].strip() if len(parts) > 1 else ""
+            if not cmd:
+                _pc("[Bash] Usage: /bash <command>", "\033[96m")
+                _pc("    Runs with the same safety guards and confirmation as the", COLORS_DIM)
+                _pc("    agent's run_command tool.", COLORS_DIM)
+                return
+            runner = agent.tools.get("run_command")
+            if runner is None:
+                _pc("[Bash] run_command tool unavailable.", "\033[91m")
+                return
+            result = await runner.execute(command=cmd)
+            _pc(result, "" if not result.startswith("Error") else "\033[91m")
+            return
+        if low == "byok":
+            _pc("[BYOK] Bring your own key — edit your config file:", "\033[96m")
+            _pc(f"    {_HOME_CONFIG_PATH}", COLORS_DIM)
+            _pc("    Set OPENAI_API_KEY / base_url / model (any OpenAI-compatible", COLORS_DIM)
+            _pc("    endpoint works, including a free Groq key). A ./.env in the", COLORS_DIM)
+            _pc("    current folder overrides it. Or rerun: mforege --setup", COLORS_DIM)
+            return
+        if low == "feedback":
+            _pc("[Feedback] MForege is your project — ideas go straight to the", "\033[96m")
+            _pc("    source: https://github.com/munjurdev/MForege/issues 💚", COLORS_DIM)
+            return
 
         _pc("MForege: ", "\033[96m\033[1m")
         try:
             response = await agent.chat(text, stream=True)
+            reply_text = ""
             if hasattr(response, "__aiter__"):
                 async for chunk in response:
+                    reply_text += chunk
                     _pc(chunk, "", end="")
                 _pc("")
             else:
+                reply_text = response
                 _pc(response)
+            session.append(text, reply_text)
+            session_store.save(session)
         except Exception as e:
             _pc(f"[!] {e}", "\033[91m")
         status = plan_state.progress_line()
@@ -535,6 +659,97 @@ async def main(argv: list[str] | None = None) -> None:
     base_status = f"{args.model} │ {workspace}"
     ui = ChatUI(status_text=base_status)
 
+    # Live context meter (like an agent panel): ~tokens used / window %.
+    def refresh_context_meter() -> None:
+        try:
+            used, window = agent.context_usage()
+            pct = int(used * 100 / max(1, window))
+            meter = f"~{used / 1000:.1f}K ({pct}%)"
+            ui.set_status(f"{base_status} │ ctx {meter}")
+        except Exception:
+            pass  # display must never break the chat
+
+    refresh_context_meter()
+
+    # ── session persistence (resume across restarts) ───────────────
+    session_store = SessionStore()
+    session = session_store.start()
+
+    # Auto-continue: pick up the most recent chat automatically (like an
+    # agent session that survives cutoffs). Shows a transcript note.
+    _latest = session_store.latest_id()
+    if _latest:
+        _stored = session_store.load(_latest)
+        if _stored and _stored.messages:
+            agent.restore_session_messages(_stored.messages)
+            session.id = _stored.id
+            session.title = _stored.title
+            session.messages = list(_stored.messages)
+            ui.append(f"[↩] Continuing your last chat — '{_stored.title}' ({len(_stored.messages)} messages). /clear to start fresh, /sessions for more.",
+                      style="class:dim")
+
+    # Live TODOS block: PlanState notifies → transcript block redraws in
+    # place (Codebuff-style checkmarks). Falls back silently if anything
+    # goes wrong — the plan itself is more important than the rendering.
+    def render_plan_block() -> None:
+        try:
+            lines = plan_state.render_block()
+            if not lines:
+                return
+            ui.replace_block("TODOS", [
+                ("class:plan", " TODOS\n"),
+                *[("class:ok" if ln.startswith("✓") else "class:plan", f" {ln}\n")
+                  for ln in lines[1:]],
+            ])
+        except Exception:
+            pass
+
+    plan_state.on_change = render_plan_block
+
+    # /sessions + /resume for the full UI (same semantics as plain mode)
+    async def handle_ui_sessions_command(user_input, agent, session,
+                                         store, ui) -> None:
+        parts = user_input.split(maxsplit=1)
+        slash = parts[0].lower()
+        if slash == "/sessions":
+            rows = store.list()
+            if not rows:
+                ui.append("[Sessions] No saved conversations yet.", style="class:dim")
+                return
+            ui.append("[Sessions] Recent conversations (newest first):",
+                      style="class:title")
+            for r in rows:
+                ui.append(f"   {r['id']}  ({r['count']} msgs)  {r['title'][:44]}",
+                          style="class:dim")
+            ui.append("   → /resume <id> to continue one", style="class:dim")
+            return
+        # /resume [id]
+        rows = store.list()
+        if not rows:
+            ui.append("[Resume] No saved conversations to resume.", style="class:warn")
+            return
+        target = None
+        if len(parts) > 1:
+            wanted = parts[1].strip()
+            target = next((r for r in rows if r["id"].startswith(wanted)), None)
+            if target is None:
+                ui.append(f"[Resume] No session matching '{wanted}'. Try /sessions.",
+                          style="class:error")
+                return
+        else:
+            target = rows[0]
+        stored = store.load(target["id"])
+        if stored is None or not stored.messages:
+            ui.append("[Resume] That session is empty.", style="class:error")
+            return
+        agent.restore_session_messages(stored.messages)
+        session.id = stored.id
+        session.title = stored.title
+        session.messages = list(stored.messages)
+        ui.append(f"[Resume] Restored '{stored.title}' ({len(stored.messages)} messages).",
+                  style="class:ok")
+        ui.append("   Context is back — just continue chatting.", style="class:dim")
+
     # Upgrade banner (24h-cached PyPI check; silent on any failure)
     update_banner = check_for_update(__version__)
     if update_banner:
@@ -550,16 +765,24 @@ async def main(argv: list[str] | None = None) -> None:
                              plan_state=plan_state, notify=notify_hook),
     )
 
-    # Agent activity → colored transcript, live
+    # Agent activity → colored transcript, live. Also pinned one-liner
+    # ("✸ read_file(path=settings.py)") above the input so the user always
+    # sees which file/command MForege is touching right now.
     def render_activity(event: str, detail: str) -> None:
         try:
             if event == "tool_start":
                 ui.append(f"  · {detail}", end="", style="class:dim")
+                ui.set_activity(detail)
             elif event == "tool_end":
                 style = "class:ok" if "✓" in detail else "class:error"
                 ui.append(f" {detail}", style=style)
+                ui.set_activity(None)
             elif event == "round":
                 ui.append(f"  ── round {detail} ──", style="class:dim")
+            elif event == "reasoning":
+                # Streamed thinking tokens → live italic "Thinking" block,
+                # replaced in place until the first real answer token.
+                ui.stream_thinking(detail)
         except Exception:
             pass  # display must never break the chat
 
@@ -585,29 +808,174 @@ async def main(argv: list[str] | None = None) -> None:
     notify_hook.callback = render_notify
 
     # ── Startup greeting (colored, in-UI) ─────────────────────────────
-    name = agent.long_term_memory.guess_name()
-    fact_count = agent.long_term_memory.count
     if not search_tool.is_configured:
         ui.append("[i] Optional: web search is off. Get a free Exa key at https://dashboard.exa.ai",
                   style="class:warn")
         ui.append("    and add EXA_API_KEY=... to ~/.mforege/.env to enable it. Everything else works.",
                   style="class:warn")
-    ui.append("  MForege — your personal AI agent ✦", style="class:title")
-    ui.append(f"  backend: {args.backend} │ model: {args.model}", style="class:dim")
-    ui.append(f"  workspace: {workspace}", style="class:dim")
-    if name:
-        ui.append(f"  Welcome back, {name}! 👋", style="class:ok")
-    elif fact_count:
-        ui.append("  Welcome back! 👋", style="class:ok")
-    else:
-        ui.append("  Nice to meet you! 👋 I'm MForege.", style="class:ok")
-    ui.append("  /help for commands. Enter=send, Shift+Enter=newline, Ctrl+C=quit.",
-              style="class:dim")
+    if os.environ.get("TERM_PROGRAM") == "vscode":
+        ui.append("[i] VS Code: Shift+Enter needs a one-time keybinding — /vscode-hint", "class:dim")
+        ui.append("    Use Alt+Enter meanwhile.", "class:dim")
+    ui.append(boxed([
+        "MForege ✦ your personal AI agent",
+        f"backend: {args.backend} │ model: {args.model}",
+        f"workspace: {workspace}",
+        "",
+        "Nice to meet you! 👋",
+        "Type / for the command menu · Enter=send",
+        "Shift/Alt+Enter=newline · Ctrl+T=thinking · Ctrl+C=quit",
+    ]), style="class:ok")
     ui.append("")
+
+    # ── Codebuff-parity slash commands ────────────────────────────
+    async def handle_buffuff_command(user_input: str) -> None:
+        """Freebuff-style commands: /diagnostics /review /copy /export
+        /theme:toggle /reasoning /queue /new /history /bash /byok /feedback
+        /interview. Keep behavior identical across plain and UI."""
+        slash = user_input.split()[0].lower()
+        if slash == "/diagnostics":
+            used, window = agent.context_usage()
+            pct = int(used * 100 / max(1, window))
+            ui.append("[Diagnostics]", style="class:title")
+            ui.append(f"  version        {__version__}", style="class:dim")
+            ui.append(f"  backend        {args.backend}", style="class:dim")
+            ui.append(f"  model          {args.model}", style="class:dim")
+            ui.append(f"  workspace      {workspace}", style="class:dim")
+            ui.append(f"  tools          {len(agent.tools.list())} registered", style="class:dim")
+            ui.append(f"  context        ~{used / 1000:.1f}K / {window // 1000}K ({pct}%)", style="class:dim")
+            ui.append(f"  history        {len(agent.memory.messages)} messages, summary {'yes' if agent.memory.summary else 'no'}", style="class:dim")
+            ui.append(f"  sessions       {len(session_store.list())} saved", style="class:dim")
+            return
+        if slash == "/review":
+            msgs = [m for m in agent.memory.messages if m.role in ("user", "assistant")]
+            if not msgs:
+                ui.append("[Review] Nothing in this conversation yet.", style="class:warn")
+                return
+            ui.append("[Review] Changes made via tools this conversation:", style="class:title")
+            shown = False
+            for ln in ui._segments:
+                if ln.get("kind") != "text":
+                    continue
+                for style, text in ln["lines"]:
+                    t = text.strip()
+                    if t.startswith("·") or t.startswith("$") or t.startswith("✓ Applied"):
+                        ui.append(f"  {t}", style="class:dim")
+                        shown = True
+            if not shown:
+                ui.append("  No tool activity yet — nothing to review.", style="class:dim")
+            return
+        if slash == "/copy":
+            lines = []
+            for m in agent.memory.messages:
+                who = "You" if m.role == "user" else "MForege"
+                lines.append(f"{who}: {m.content}")
+            text = "\n".join(lines)
+            try:
+                import pyperclip # type: ignore
+                pyperclip.copy(text)
+                ui.append("[Copy] Conversation copied to clipboard.", style="class:ok")
+            except Exception:
+                import tempfile
+                f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+                f.write(text)
+                f.close()
+                ui.append(f"[Copy] Clipboard unavailable — saved to {f.name}", style="class:warn")
+            return
+        if slash == "/export":
+            import json as _json
+            import time as _time
+            fname = os.path.join(os.getcwd(), f"mforege-export-{_time.strftime('%Y%m%d-%H%M%S')}.json")
+            try:
+                with open(fname, "w", encoding="utf-8") as f:
+                    _json.dump({
+                        "exported": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "model": args.model,
+                        "messages": agent.export_session_messages(),
+                    }, f, ensure_ascii=False, indent=2)
+                ui.append(f"[Export] Full conversation → {fname}", style="class:ok")
+            except Exception as e:
+                ui.append(f"[Export] Failed: {e}", style="class:error")
+            return
+        if slash == "/theme:toggle":
+            ui.toggle_theme()
+            cur = "dark" if ui._dark_theme else "light"
+            ui.append(f"[Theme] Switched to {cur} mode.", style="class:ok")
+            return
+        if slash == "/reasoning":
+            parts = user_input.split(maxsplit=1)
+            level = parts[1].strip().lower() if len(parts) > 1 else ""
+            if level not in ("low", "high", "max"):
+                ui.append("[Reasoning] Usage: /reasoning low | high | max", style="class:warn")
+                ui.append(f"   current: {getattr(agent.config, 'reasoning_effort', 'high')}", style="class:dim")
+                return
+            agent.config.reasoning_effort = level
+            ui.append(f"[Reasoning] Set to {level}.", style="class:ok")
+            return
+        if slash == "/queue":
+            ui.append("[Queue] Message queueing is not needed — MForege processes", style="class:dim")
+            ui.append("   each message immediately; send after the reply lands.", style="class:dim")
+            return
+        if slash == "/new":
+            agent.clear_memory()
+            session = session_store.start()
+            ui.clear()
+            ui.append("[*] New conversation started — fresh context.", style="class:ok")
+            return
+        if slash == "/history":
+            rows = session_store.list()
+            if not rows:
+                ui.append("[History] No saved conversations yet.", style="class:dim")
+                return
+            ui.append("[History] Recent conversations (newest first):", style="class:title")
+            for r in rows:
+                ui.append(f"   {r['id']}  ({r['count']} msgs)  {r['title'][:44]}", style="class:dim")
+            ui.append("   → /resume <id> to continue one — /new to start fresh.", style="class:dim")
+            return
+        if slash == "/interview":
+            ui.append("[Interview] Tell me your goal in one line — I'll ask targeted", style="class:title")
+            ui.append("    questions one at a time to pin down scope, constraints and", style="class:dim")
+            ui.append("    trade-offs, then turn it into a step-by-step plan.", style="class:dim")
+            return
+        if slash == "/bash":
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[1].strip() if len(parts) > 1 else ""
+            if not cmd:
+                ui.append("[Bash] Usage: /bash <command>", style="class:warn")
+                ui.append("    Runs with the same safety guards and confirmation as the", style="class:dim")
+                ui.append("    agent's run_command tool.", style="class:dim")
+                return
+            runner = agent.tools.get("run_command")
+            if runner is None:
+                ui.append("[Bash] run_command tool unavailable.", style="class:error")
+                return
+            result = await runner.execute(command=cmd)
+            err = result.startswith("Error")
+            for ln in result.split("\n"):
+                ui.append(ln, style="class:error" if err else None)
+            return
+        if slash == "/byok":
+            ui.append("[BYOK] Bring your own key — edit your config file:", style="class:title")
+            ui.append(f"    {_HOME_CONFIG_PATH}", style="class:dim")
+            ui.append("    Set OPENAI_API_KEY / base_url / model (any OpenAI-compatible", style="class:dim")
+            ui.append("    endpoint works, including a free Groq key). A ./.env in the", style="class:dim")
+            ui.append("    current folder overrides it. Or rerun: mforege --setup", style="class:dim")
+            return
+        if slash == "/feedback":
+            ui.append("[Feedback] MForege is your project — ideas go straight to the", style="class:title")
+            ui.append("    source: https://github.com/munjurdev/MForege/issues 💚", style="class:dim")
+            return
+        ui.append(f"[?] Unknown command {slash} — /help for the list.", style="class:warn")
 
     # ── Message handler (runs inside the UI event loop) ───────────────
     async def handle_message(user_input: str) -> None:
-        ui.append(f"You: {user_input}", style="class:you")
+        nonlocal session
+        # Multi-line user messages: prefix each line so a long paste doesn't
+        # render as one giant green wall (screenshot feedback)
+        lines = user_input.split("\n")
+        ui.scroll_bottom()  # sending = want to see the fresh reply
+        ui.append(f"You: {lines[0]}", style="class:you")
+        for extra in lines[1:]:
+            ui.append(f"    {extra}", style="class:you")
 
         low = user_input.lower().strip()
 
@@ -619,19 +987,54 @@ async def main(argv: list[str] | None = None) -> None:
                 for cmd, desc in [
                     ("/plan", "Show the current mission plan"),
                     ("/tools", "List registered tools"),
-                    ("/memory", "Show what MForege remembers"),
-                    ("/forget", "Wipe long-term memory"),
-                    ("/clear", "Reset conversation + transcript"),
+                    ("/new", "Clear the conversation and start a new chat"),
+                    ("/history", "Browse and resume past conversations"),
+                    ("/sessions", "List past conversations"),
+                    ("/resume [id]", "Resume a recent chat (default: latest)"),
+                    ("/diagnostics", "Version, model, context usage, sessions"),
+                    ("/review", "Review changes made this conversation"),
+                    ("/copy", "Copy the conversation to clipboard"),
+                    ("/export", "Write the conversation to a .json file"),
+                    ("/bash", "Run a shell command with the agent's safety guards"),
+                    ("/byok", "Show where to configure your API key / model"),
+                    ("/queue", "Message queueing info"),
+                    ("/interview", "Guided Q&A to spec a task before building"),
+                    ("/theme:toggle", "Toggle light/dark mode"),
+                    ("/reasoning", "Thinking effort: low / high / max"),
+                    ("/feedback", "Share feedback about MForege"),
+                    ("/vscode-hint", "Fix Shift+Enter for VS Code's terminal"),
+                    ("/clear", "Reset conversation + transcript (like /new)"),
                     ("/exit", "Quit"),
                 ]:
                     ui.append(f"  {cmd:<10} {desc}", style="class:dim")
+                return
+            if slash in ("/diagnostics", "/review", "/copy", "/export",
+                         "/theme:toggle", "/reasoning", "/queue", "/new",
+                         "/history", "/bash", "/byok", "/feedback", "/interview"):
+                await handle_buffuff_command(user_input)
                 return
             if slash == "/plan":
                 rendered = plan_state.render()
                 ui.append(rendered if rendered else "No active plan.", style="class:plan")
                 return
-            # /tools /memory /forget /clear /exit → handled as plain commands
-            user_input = slash[1:]
+            if slash == "/vscode-hint":
+                ui.append("[VS Code Shift+Enter fix] (one-time, 30 seconds):", style="class:title")
+                ui.append("  1. Ctrl+Shift+P → 'Preferences: Open Keyboard Shortcuts (JSON)'", style="class:dim")
+                ui.append('  2. Add inside the [ ] array:', style="class:dim")
+                ui.append('     { "key": "shift+enter",', style="class:dim")
+                ui.append('       "command": "workbench.action.terminal.sendSequence",', style="class:dim")
+                ui.append('       "args": { "text": "\\u001b\\r" },', style="class:dim")
+                ui.append('       "when": "terminalFocus" }', style="class:dim")
+                ui.append("  3. Save, then restart VS Code completely.")
+                ui.append("  → VS Code then sends ESC+CR for Shift+Enter — which MForege already")
+                ui.append("    treats as a newline. (Same fix Claude Code recommends.)")
+                return
+            if slash in ("/sessions", "/resume"):
+                await handle_ui_sessions_command(user_input, agent, session,
+                                                 session_store, ui)
+                return
+            # /tools /new /history /bash /byok /feedback /clear /exit → plain commands
+            user_input = user_input[1:]
             low = user_input.lower()
 
         # Plain commands
@@ -644,20 +1047,17 @@ async def main(argv: list[str] | None = None) -> None:
             ui.clear()
             ui.append("[*] Conversation cleared", style="class:ok")
             return
-        if low == "memory":
-            facts = agent.long_term_memory.all()
-            if facts:
-                ui.append(f"[Memory] What MForege remembers about you ({len(facts)}):",
-                          style="class:title")
-                for i, fact in enumerate(facts, 1):
-                    ui.append(f"   {i}. {fact}")
-            else:
-                ui.append("[Memory] Nothing remembered yet — chat and MForege will learn!",
-                          style="class:warn")
+        if low == "new":
+            agent.clear_memory()
+            session = session_store.start()
+            ui.clear()
+            ui.append("[*] New conversation started — fresh context.", style="class:ok")
             return
-        if low in ("forget", "forget all", "forget everything"):
-            agent.clear_long_term_memory()
-            ui.append("[*] Long-term memory wiped.", style="class:ok")
+        if low in ("memory", "forget", "forget all", "forget everything"):
+            ui.append("[i] MForege keeps only conversation context now (like an agent):",
+                      style="class:dim")
+            ui.append("    auto-continues your last chat; /sessions + /resume manage history.",
+                      style="class:dim")
             return
         if low == "tools":
             ui.append("[Tools] Available tools:", style="class:title")
@@ -668,7 +1068,7 @@ async def main(argv: list[str] | None = None) -> None:
         # Chat (streaming). The pending-extraction happens inside chat();
         # show "thinking" while we wait for the first token.
         ui.set_status("thinking…")
-        ui.append("MForege: ", end="", style="class:assistant")
+        reply_text = ""
         try:
             response = await agent.chat(user_input, stream=True)
 
@@ -677,14 +1077,32 @@ async def main(argv: list[str] | None = None) -> None:
                 async for chunk in response:
                     if first:
                         ui.set_status("responding…")
+                        ui.finish_thinking()   # collapse the Thinking block
+                        ui.append("MForege: ", end="", style="class:assistant")
                         first = False
+                    reply_text += chunk
                     ui.append(chunk, end="")
                 ui.append("")
             else:
+                ui.finish_thinking()
+                ui.append("MForege: ", end="", style="class:assistant")
+                reply_text = response
                 ui.append(response)
         finally:
+            ui.finish_thinking()  # safety: never leave a dangling block
+            refresh_context_meter()  # tokens grew — update the meter
             status = plan_state.progress_line()
-            ui.set_status(f"{base_status} │ {status}" if status else base_status)
+            if status:
+                cur = ui._status
+                sep = " │ " if "ctx" in cur else ""
+                ui.set_status(f"{cur}{sep}{status}")
+
+        # save the exchange (incremental — a crash loses at most one message)
+        try:
+            session.append(user_input, reply_text)
+            session_store.save(session)
+        except Exception:
+            pass
 
         status = plan_state.progress_line()
         if status:

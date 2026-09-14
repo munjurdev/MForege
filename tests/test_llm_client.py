@@ -118,3 +118,64 @@ class TestRetries:
         with patch.object(client.client.chat.completions, "create", new=AsyncMock(side_effect=bad_request)):
             with pytest.raises(LLMResponseError):
                 await client.create_chat_completion(model="m", messages=[])
+
+
+class TestConfigKwargStripping:
+    @pytest.mark.asyncio
+    async def test_config_kwarg_never_reaches_sdk(self):
+        """Regression: `config` is MForege-internal. If it leaks into
+        client.chat.completions.create(), the OpenAI SDK raises
+        TypeError: unexpected keyword argument 'config' — breaking every
+        chat (caught live in v0.1.9 testing)."""
+        client = LLMClient(backend="custom", api_key="x",
+                           base_url="http://localhost:9999/v1")
+
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+        client.client.chat.completions.create = fake_create
+        cfg = type("Cfg", (), {"reasoning_effort": "low"})()
+
+        result = await client.create_chat_completion(
+            model="m", messages=[{"role": "user", "content": "hi"}],
+            config=cfg,
+        )
+        assert result == "ok"
+        assert "config" not in captured, (
+            "config kwarg leaked into the OpenAI SDK call"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_forwarded_via_extra_body(self):
+        client = LLMClient(backend="custom", api_key="x",
+                           base_url="http://localhost:9999/v1")
+
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+        client.client.chat.completions.create = fake_create
+        cfg = type("Cfg", (), {"reasoning_effort": "low"})()
+
+        await client.create_chat_completion(model="m", messages=[], config=cfg)
+        body = captured.get("extra_body") or {}
+        assert body.get("reasoning_effort") == "low"
+        assert body.get("include_reasoning") is True
+
+    @pytest.mark.asyncio
+    async def test_no_config_still_works(self):
+        client = LLMClient(backend="custom", api_key="x",
+                           base_url="http://localhost:9999/v1")
+
+        async def fake_create(**kwargs):
+            assert "extra_body" in kwargs  # include_reasoning still set
+            assert "reasoning_effort" not in kwargs["extra_body"]
+            return "ok"
+
+        client.client.chat.completions.create = fake_create
+        await client.create_chat_completion(model="m", messages=[])

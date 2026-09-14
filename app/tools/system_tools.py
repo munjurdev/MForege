@@ -914,25 +914,42 @@ class TodoPlanTool(Tool):
 
 
 class PlanState:
-    """Shared plan storage: used by the tool, the CLI statusline, and prompt injection."""
+    """Shared plan storage: used by the tool, the CLI statusline, and prompt injection.
 
-    def __init__(self):
+    Optionally takes an `on_change` observer — fired after every mutation so
+    the UI can redraw the plan block live (Codebuff-style TODOS list).
+    """
+
+    def __init__(self, on_change: Optional[Callable[[], None]] = None):
         self.steps: List[dict] = []  # [{"text": str, "done": bool}]
+        self.on_change = on_change
+
+    def _notify(self) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change()
+        except Exception:
+            pass
 
     def set(self, steps: List[str]) -> None:
         self.steps = [{"text": s, "done": False} for s in steps]
+        self._notify()
 
     def add(self, text: str) -> None:
         self.steps.append({"text": text, "done": False})
+        self._notify()
 
     def mark(self, index: int, done: bool) -> bool:
         if 1 <= index <= len(self.steps):
             self.steps[index - 1]["done"] = done
+            self._notify()
             return True
         return False
 
     def clear(self) -> None:
         self.steps = []
+        self._notify()
 
     def render(self) -> str:
         """Human-readable plan, e.g. for the CLI statusline."""
@@ -944,6 +961,22 @@ class PlanState:
             lines.append(f"[{box}] {i}. {s['text']}")
         done_count = sum(1 for s in self.steps if s["done"])
         return f"\n".join(lines) + f"\n({done_count}/{len(self.steps)} done)"
+
+    def render_block(self) -> List[str]:
+        """Codebuff-style TODOS block: ✓ done · ✎ current · · pending."""
+        if not self.steps:
+            return []
+        lines = ["TODOS"]
+        current_shown = False
+        for s in self.steps:
+            if s["done"]:
+                lines.append(f"✓ {s['text']}")
+            elif not current_shown:
+                lines.append(f"✎ {s['text']}")  # in progress right now
+                current_shown = True
+            else:
+                lines.append(f"· {s['text']}")
+        return lines
 
     def progress_line(self) -> str:
         """One-line summary for the CLI statusline."""

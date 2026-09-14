@@ -74,3 +74,62 @@ class TestConversationMemory:
         mem = ConversationMemory()
         assert mem.last_user_message is None
         assert mem.last_message() is None
+
+
+class TestAutoCondense:
+    """Auto-condensation: old turns fold into a summary (session-summary style)"""
+
+    def _fill(self, n=30):
+        m = ConversationMemory(max_messages=200)
+        for i in range(n):
+            m.add(Message(role="user", content=f"Q{i} " + "x" * 120))
+            m.add(Message(role="assistant", content=f"A{i} " + "y" * 120))
+        return m
+
+    def test_no_condense_when_below_threshold(self):
+        m = self._fill(3)
+        assert m.maybe_condense(131072) is False
+        assert m.summary == ""
+
+    def test_condenses_when_over_threshold(self):
+        m = self._fill(30)
+        m.CONDENSE_AT = 0.0
+        assert m.maybe_condense(2000) is True
+        assert m.summary != ""
+        assert len(m.messages) == ConversationMemory.KEEP_RECENT
+        # recent kept verbatim
+        assert m.messages[-1].content.startswith("A29")
+
+    def test_summary_injected_into_api_messages(self):
+        from app.agent.memory import ConversationMemory as CM  # noqa: F401
+        m = self._fill(30)
+        m.CONDENSE_AT = 0.0
+        m.maybe_condense(2000)
+        msgs = [
+            {"role": "system", "content": "sys"},
+            *m.to_openai_format(),
+        ]
+        # the agent injects summary separately; here just verify summary text
+        assert "Q0" in m.summary and "A5" in m.summary
+
+    def test_idempotent_no_re_fold_of_recent(self):
+        m = self._fill(30)
+        m.CONDENSE_AT = 0.0
+        m.maybe_condense(2000)
+        before = list(m.messages)
+        # still over threshold (summary counts), but only KEEP_RECENT remain
+        folded_again = m.maybe_condense(2000)
+        # with only KEEP_RECENT messages left, nothing more to fold
+        assert folded_again is False
+        assert [x.content for x in m.messages] == [x.content for x in before]
+
+    def test_token_estimate_counts_summary(self):
+        m = ConversationMemory()
+        m.add(Message(role="user", content="a" * 400))
+        base = m.token_estimate()
+        m.summary = "s" * 400
+        assert m.token_estimate() > base
+
+    def test_zero_window_is_safe(self):
+        m = self._fill(5)
+        assert m.maybe_condense(0) is False

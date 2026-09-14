@@ -38,11 +38,22 @@ class ConversationMemory:
     - Limits maximum conversation length
     - Can export in OpenAI format
     - Supports clearing and truncation
+    - Auto-condensation: when history approaches the model's context
+      window, older turns are folded into a compact summary (like an
+      agent session summary) instead of being silently dropped
     """
     
+    # Condense when estimated usage crosses this fraction of the window
+    CONDENSE_AT = 0.70
+    # Recent messages always kept verbatim when condensing
+    KEEP_RECENT = 8
+    # Max chars of each folded message kept in the summary
+    SUMMARY_CLIP = 160
+
     def __init__(self, max_messages: int = 100):
         self.messages: list[Message] = []
         self.max_messages = max_messages
+        self.summary: str = ""  # condensed memory of folded older turns
         
     def add(self, message: Message) -> None:
         """Add a message to history"""
@@ -63,6 +74,45 @@ class ConversationMemory:
         kept_other = other_msgs[-keep_count:] if keep_count > 0 else []
         self.messages = system_msgs + kept_other
         
+    def token_estimate(self) -> int:
+        """Rough token count (chars/4 heuristic — good enough for a meter)."""
+        total = sum(len(m.content) for m in self.messages)
+        if self.summary:
+            total += len(self.summary)
+        return total // 4
+
+    def maybe_condense(self, context_window: int) -> bool:
+        """
+        Fold the oldest turns into `summary` when history grows past
+        CONDENSE_AT of the context window. Returns True if a fold happened.
+
+        Mirrors how agent sessions survive long runs: nothing important is
+        silently dropped — the oldest parts become a compact digest that is
+        injected as a system message, recent turns stay verbatim.
+        """
+        if context_window <= 0:
+            return False
+        if self.token_estimate() < int(context_window * self.CONDENSE_AT):
+            return False
+        system_msgs = [m for m in self.messages if m.role == "system"]
+        other_msgs = [m for m in self.messages if m.role != "system"]
+        if len(other_msgs) <= self.KEEP_RECENT:
+            return False
+
+        fold = other_msgs[:-self.KEEP_RECENT]
+        lines = []
+        for m in fold:
+            tag = {"user": "User", "tool": "Tool"}.get(m.role, "MForege")
+            text = " ".join(m.content.split())
+            if text:
+                lines.append(f"- {tag}: {text[:self.SUMMARY_CLIP]}")
+        if lines:
+            self.summary = (self.summary + "\n" if self.summary else "") + "\n".join(lines)
+
+        keep_count = max(0, self.max_messages - len(system_msgs))
+        self.messages = system_msgs + other_msgs[-self.KEEP_RECENT:][-keep_count:]
+        return True
+
     def get(self, role: Optional[str] = None, limit: Optional[int] = None) -> List[Message]:
         """Get messages, optionally filtered by role and limited"""
         result = self.messages

@@ -4,7 +4,7 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-data/memory.json
+data/sessions/
 
 # packaging artifacts
 *.egg-info/

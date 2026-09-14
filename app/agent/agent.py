@@ -21,7 +21,6 @@ from pydantic import BaseModel
 from ..llm import LLMClient
 from .memory import ConversationMemory, Message
 from .tools import Tool, ToolRegistry
-from .long_term_memory import LongTermMemory, extract_facts
 
 # How many model<->tool round trips a single chat() call may make by default
 # (configurable per-agent via AgentConfig.max_tool_rounds or MAX_TOOL_ROUNDS env)
@@ -34,6 +33,12 @@ class AgentConfig(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 4096
     max_tool_rounds: int = MAX_TOOL_ROUNDS
+    # Model context window (tokens). Used for the live context meter and
+    # auto-condensation. Conservative default; Groq's gpt-oss-20b serves 131k.
+    context_window: int = 131072
+    # Reasoning effort for reasoning models (low/high/max). Forwarded to
+    # backends that support it; ignored gracefully by those that don't.
+    reasoning_effort: str = "high"
     system_prompt: str = """You are MForege, a personal AI assistant with a warm, playful personality.
 
 # Identity
@@ -116,8 +121,7 @@ class Agent:
     """
 
     def __init__(self, config: Optional[AgentConfig] = None, api_key: Optional[str] = None,
-                 backend: str = "openai", base_url: Optional[str] = None,
-                 memory_path: Optional[str] = None):
+                 backend: str = "openai", base_url: Optional[str] = None):
         self.config = config or AgentConfig()
         self.llm = LLMClient(
             backend=backend,
@@ -127,8 +131,6 @@ class Agent:
         )
         self.memory = ConversationMemory()
         self.tools = ToolRegistry()
-        self.long_term_memory = LongTermMemory(path=memory_path)
-        self._pending_exchange: Optional[Tuple[str, str]] = None  # (user msg, reply) awaiting memory extraction
         self.on_activity: Optional[Callable[[str, str], None]] = None  # (event, detail) -> UI hook
 
     def _emit(self, event: str, detail: str = "") -> None:
@@ -161,10 +163,6 @@ class Agent:
             If streaming: async generator yielding text chunks
             If not streaming: complete response string
         """
-        # Add user message to memory
-        # First, remember anything durable from the previous exchange
-        await self._process_pending_memory()
-
         self.memory.add(Message(role="user", content=message))
 
         stream_mode = stream if stream is not None else self.config.streaming
@@ -173,51 +171,76 @@ class Agent:
             return self._stream_response(user_message=message)
 
         reply = await self._get_response()
-        self._pending_exchange = (message, reply)
-        await self._process_pending_memory()  # remember this exchange immediately
         return reply
 
     async def flush_memory(self) -> None:
-        """Force extraction of any pending exchange (call before shutdown)"""
-        await self._process_pending_memory()
+        """Kept for API compatibility (no extraction happens anymore)."""
+        return
+
+    # ── session persistence (resume across restarts) ─────────────────
+
+    def export_session_messages(self) -> List[Dict]:
+        """OpenAI-format history for saving a session."""
+        return self.memory.to_openai_format()
+
+    def restore_session_messages(self, messages: List[Dict]) -> None:
+        """
+        Replace conversation history with a saved session's messages
+        (OpenAI format). Only role/content pairs are accepted; anything
+        malformed is skipped. Condensed summary is cleared — the restored
+        verbatim history supersedes it.
+        """
+        clean: List[Message] = []
+        for m in messages or []:
+            try:
+                role = m.get("role")
+                content = m.get("content")
+                if role in ("user", "assistant") and isinstance(content, str) and content:
+                    clean.append(Message(role=role, content=content))
+            except Exception:
+                continue
+        self.memory.messages = clean
+        self.memory.summary = ""
 
     async def _process_pending_memory(self) -> None:
-        """Extract durable facts from the pending exchange (best-effort)"""
-        if not self._pending_exchange:
-            return
-        user_msg, reply = self._pending_exchange
-        self._pending_exchange = None
-        try:
-            new_facts = await extract_facts(
-                self.llm, self.config.model, user_msg, reply,
-                self.long_term_memory.all(),
-            )
-        except Exception:
-            return  # memory is best-effort; never disrupt chatting
-        for fact in new_facts:
-            self.long_term_memory.add(fact)
+        """No-op placeholder (kept for API compatibility). Cross-session
+        persistence now lives entirely in the session store; conversation
+        continuity comes from auto-continue + auto-condense."""
+        return
 
     def _build_api_messages(self) -> List[Dict]:
-        """Build the message list sent to the API (system prompt + plan + memories + history)"""
-        system_prompt = self.long_term_memory.inject_into(self.config.system_prompt)
+        """Build the message list sent to the API (system prompt + plan + history)"""
+        system_prompt = self.config.system_prompt
         plan = getattr(self, "plan_state", None)
         if plan is not None and plan.steps:
             system_prompt += (
                 "\n\n# Current mission plan (use todo_plan to update it as you progress)\n"
                 + plan.render()
             )
-        return [
-            {"role": "system", "content": system_prompt},
-            *self.memory.to_openai_format(),
-        ]
+        msgs: List[Dict] = [{"role": "system", "content": system_prompt}]
+        # Condensed history (auto-summary of turns folded out of context —
+        # like a session summary, so long missions never lose their start)
+        if self.memory.summary:
+            msgs.append({
+                "role": "system",
+                "content": "# Earlier conversation (condensed)\n" + self.memory.summary,
+            })
+        msgs.extend(self.memory.to_openai_format())
+        return msgs
 
     def _tools_schema(self) -> Optional[List[Dict]]:
         return self.tools.to_openai_schema() if self.tools.tools else None
+
+    def context_usage(self) -> tuple[int, int]:
+        """(estimated tokens in next request, model context window size)."""
+        return self.memory.token_estimate(), self.config.context_window
 
     # ── Non-streaming path ─────────────────────────────
     async def _get_response(self) -> str:
         """Run the tool loop until the model produces a final text answer"""
         messages = self._build_api_messages()
+        # Auto-condense BEFORE sending if approaching the context window
+        self.memory.maybe_condense(self.config.context_window)
         tools_schema = self._tools_schema()
 
         for round_num in range(1, self.config.max_tool_rounds + 1):
@@ -229,7 +252,8 @@ class Agent:
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
                 tools=tools_schema,
-                tool_choice="auto" if tools_schema else None
+                tool_choice="auto" if tools_schema else None,
+                config=self.config,
             )
 
             msg = response.choices[0].message
@@ -265,6 +289,7 @@ class Agent:
             messages=messages,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            config=self.config,
         )
         content = response.choices[0].message.content or ""
         self.memory.add(Message(role="assistant", content=content))
@@ -281,6 +306,8 @@ class Agent:
         text answer (streamed chunk by chunk).
         """
         messages = self._build_api_messages()
+        # Auto-condense BEFORE sending if approaching the context window
+        self.memory.maybe_condense(self.config.context_window)
         tools_schema = self._tools_schema()
         full_content = ""
         saved = False
@@ -296,7 +323,8 @@ class Agent:
                     max_tokens=self.config.max_tokens,
                     stream=True,
                     tools=tools_schema,
-                    tool_choice="auto" if tools_schema else None
+                    tool_choice="auto" if tools_schema else None,
+                    config=self.config,
                 )
 
                 round_content = ""
@@ -306,6 +334,13 @@ class Agent:
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
+
+                    # Reasoning tokens (Groq gpt-oss, DeepSeek-R1, etc.) →
+                    # surfaced as events so the UI can render a live
+                    # "Thinking" block. Never mixed into the answer text.
+                    reasoning_text = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+                    if reasoning_text:
+                        self._emit("reasoning", reasoning_text)
 
                     if delta.content:
                         round_content += delta.content
@@ -326,12 +361,10 @@ class Agent:
                                 if tc_delta.function.arguments:
                                     entry["arguments"] += tc_delta.function.arguments
 
-                # No tools requested -> this round is the final answer
+                            # No tools requested -> this round is the final answer
                 if not tool_calls:
                     self.memory.add(Message(role="assistant", content=full_content))
                     saved = True
-                    if user_message and full_content:
-                        self._pending_exchange = (user_message, full_content)
                     return
 
                 # Feed the tool-call request back and run the tools
@@ -411,16 +444,8 @@ class Agent:
     # ── Utilities ──────────────────────────────────────
 
     def clear_memory(self) -> None:
-        """Clear conversation history (session memory, not long-term facts)"""
+        """Clear conversation history (current session)"""
         self.memory.clear()
-
-    def clear_long_term_memory(self) -> bool:
-        """Forget all long-term facts across sessions"""
-        return self.long_term_memory.clear()
-
-    def remember_fact(self, fact: str) -> bool:
-        """Manually store a durable fact about the user"""
-        return self.long_term_memory.add(fact)
 
     def get_history(self) -> List[Message]:
         """Get conversation history"""

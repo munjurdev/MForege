@@ -51,8 +51,9 @@ class TestNonStreamingToolLoop:
         result = await agent.chat("what is 2+2?")
 
         assert result == "The answer is 4"
-        # 2 main calls + 1 memory-extraction side-call after the reply
-        assert len(calls) == 3
+        # 2 main calls, no extraction side-call (facts file removed —
+        # persistence is conversation-scoped via the session store)
+        assert len(calls) == 2
 
         # Second request must contain the tool result as a 'tool' role message
         second_messages = calls[1]["messages"]

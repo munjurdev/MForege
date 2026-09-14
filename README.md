@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A command-line AI agent with a transparent, IDE-style interface: live tool
-activity, colored diffs on every file change, mission plans, and long-term
-memory. Supports OpenAI, Ollama (free & local), and any OpenAI-compatible
+activity, colored diffs on every file change, mission plans, and session
+persistence. Supports OpenAI, Ollama (free & local), and any OpenAI-compatible
 API (Groq, Together, etc.).
 
 ## Install
@@ -91,26 +91,44 @@ For Groq: grab a free key at https://console.groq.com (no credit card).
 
 ### Chat-style interface (prompt_toolkit)
 
-- **Bottom input box** — the input stays pinned at the bottom like a chat app;
-  the transcript scrolls above it
+- **Slash-command menu** — type `/` and a live two-column popup appears
+  (command + description); keep typing to filter, ↑/↓ to select, Enter to
+  accept, Esc to close — exactly like a modern IDE command palette
+- **Structured welcome** — a clean rounded box shows the agent name, model,
+  and workspace on startup
+- **Bottom input box** — the input stays pinned at the bottom in a bordered
+  frame like a chat app; the transcript scrolls above it
+- **Scrolling** — PgUp/PgDn (10 lines), Ctrl+↑/↓ or Shift+↑/↓ (1 line),
+  and the **mouse wheel** all scroll the transcript; `End` returns to the
+  live tail. While scrolled up the status bar shows `↑ N lines · End=bottom`
+- **Scrollbar** — a thin scrollbar on the transcript's right edge shows
+  the viewport position (auto-hidden when everything fits on screen)
 - **Live activity stream** — every tool call prints as `· tool(args) ✓ (0.3s)`
 - **Thinking timer** — `thinking Ns...` runs until the first token arrives
 - **Colored diffs** — `+` green / `-` red, shown before approval *and* in the
   transcript after the edit lands
 - **Plan statusline** — `[Plan 2/5] next: write the test` after each reply
 - **Status bar** — model, workspace, and shortcut hints always visible
-- **Keys** — Enter sends, Shift+Enter adds a newline (Alt+Enter also
-  works), Ctrl+C quits
-- **Slash commands** — `/help`, `/plan`, `/tools`, `/memory`, `/forget`,
-  `/clear`, `/exit`
+- **Keys** — Enter sends, Shift+Enter adds a newline (Windows Terminal,
+  cmd, Unix terminals). In VS Code's terminal use **Alt+Enter** for a
+  newline — VS Code never transmits Shift+Enter to any program.
+  Ctrl+T expands the AI's thinking, Ctrl+C quits
+- **Slash commands** — `/help`, `/plan`, `/tools`, `/new`, `/history`,
+  `/sessions`, `/resume`, `/bash`, `/byok`, `/interview`, `/diagnostics`,
+  `/review`, `/copy`, `/export`, `/theme:toggle`, `/reasoning`,
+  `/vscode-hint`, `/clear`, `/exit`
 
 ### Memory
 
 - **Conversation memory** — history per session, `clear` resets it
-- **Long-term memory** — after each reply a side-call asks *"did I learn
-  anything durable?"*; facts (name, projects, preferences) are saved to
-  `data/memory.json` (git-ignored) and injected into future sessions.
-  Personalized greeting on startup ("Welcome back, Munjur! 👋")
+- **Auto-condense** — when history nears the context window, old turns
+  fold into a compact summary injected before the recent ones, so long
+  missions never lose their start
+- **Context meter** — live `ctx ~12.3K (2%)` in the status bar
+- **Session resume** — every conversation auto-saves; on the next launch
+  MForege automatically continues your last chat (like an agent session
+  that survives a cutoff). `/sessions` lists past chats, `/resume [id]`
+  restores a specific one
 
 ### Resilience
 
@@ -196,15 +214,27 @@ you launch it. Workspace defaults to the current directory.
 | `/help`  | Show the command menu                      |
 | `/plan`  | Show the current mission plan              |
 | `/tools` | List registered tools                      |
-| `/memory`| Show what MForege remembers about you      |
-| `/forget`| Wipe long-term memory                      |
+| `/new`   | Clear the conversation and start a new chat |
+| `/history` | Browse past conversations (same as `/sessions`) |
+| `/sessions` | List past conversations                     |
+| `/resume` | Resume the most recent chat (or `/resume <id>`) |
+| `/bash <cmd>` | Run a shell command with the agent's safety guards |
+| `/byok`  | Show where to configure your API key / model |
+| `/interview` | Guided Q&A to spec a task before building |
+| `/diagnostics` | Version, model, context usage, sessions |
+| `/review` | Review changes made this conversation      |
+| `/copy`  | Copy the conversation to the clipboard     |
+| `/export` | Write the conversation to a .json file     |
+| `/theme:toggle` | Toggle light/dark mode               |
+| `/reasoning` | Thinking effort: low / high / max      |
+| `/vscode-hint` | Fix Shift+Enter for VS Code's terminal |
 | `/clear` | Reset conversation (current session)       |
 | `/exit`  | Quit (plain `exit` also works)             |
 
 ## Example session
 
 ```
-Welcome back, Munjur! 👋
+Nice to meet you! 👋 I'm MForege.
 
 You: create utils.py with a greet function, then test it
 Assistant: thinking 2s...
@@ -239,9 +269,11 @@ agent.register_tools(create_tool("get_weather", "Get weather for a city", get_we
 env/Scripts/python -m pytest
 ```
 
-161 tests covering conversation memory, the tool registry, the safe
-calculator, the web search tool, long-term memory (store, injection,
-extraction), system tools (path confinement, command classification,
-confirmation flow — sync and async, diffs, notifications), discovery tools
-(search/glob/read windows), the todo plan, and the agent's tool-call loop —
-all with a mocked LLM, no network needed.
+202 tests covering conversation memory (including auto-condensation), the
+tool registry, the safe calculator, the web search tool, session
+persistence (save, list, resume), the terminal UI (scrolling, thinking
+blocks, live plan blocks, Windows Shift+Enter compatibility), system tools
+(path confinement, command classification, confirmation flow — sync and
+async, diffs, notifications), discovery tools (search/glob/read windows),
+the todo plan, and the agent's tool-call loop — all with a mocked LLM, no
+network needed.
