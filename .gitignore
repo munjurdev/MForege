@@ -16,3 +16,6 @@ dist/
 .idea/
 *.swp
 *~
+
+# personal dev notes (never publish)
+dev-note.md
