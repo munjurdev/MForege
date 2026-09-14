@@ -171,7 +171,8 @@ class TimeTool(Tool):
             description="Get the current date and time",
             parameters={
                 "type": "object",
-                "properties": {}
+                "properties": {},
+                "required": []
             },
             execute=self._execute
         )

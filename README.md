@@ -205,7 +205,6 @@ you launch it. Workspace defaults to the current directory.
 
 ```
 Welcome back, Munjur! 👋
-(I remember 2 things)
 
 You: create utils.py with a greet function, then test it
 Assistant: thinking 2s...

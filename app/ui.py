@@ -148,7 +148,9 @@ class ChatUI:
                 "title": "#5fd7ff bold",
                 "warn": "#ffd75f",
             }),
-            mouse_support=True,
+            # mouse_support intentionally OFF: on Windows ConPTY terminals
+            # (VS Code) it can swallow regular keystrokes.
+            mouse_support=False,
         )
         if output is not None:
             app_kwargs["output"] = output
@@ -224,7 +226,9 @@ class ChatUI:
             rows = self.app.output.get_size().rows
         except Exception:
             pass
-        reserve = 9  # input(3) + label(1) + separators(2) + status(1) + question(1) + margin
+        # reserve = label(1) + separators(2) + status(1) + question(1)
+        #           + input (1..5, dynamic) + breathing room
+        reserve = 5 + self._input_height() + 2
         visible = max(1, rows - reserve)
         tail = self._lines[-visible:]
         for line in tail:

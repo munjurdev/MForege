@@ -105,7 +105,13 @@ class LLMClient:
 
         for attempt in range(MAX_RETRIES + 1):
             try:
-                return await self.client.chat.completions.create(**kwargs)
+                # Drop keys the backend doesn't accept (e.g., some OpenAI-
+                # compatible APIs reject tool_choice=None with tools omitted,
+                # or reject unknown params entirely)
+                call_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                if "tools" in call_kwargs and call_kwargs["tools"]:
+                    call_kwargs.setdefault("tool_choice", "auto")
+                return await self.client.chat.completions.create(**call_kwargs)
 
             except APITimeoutError:
                 last_error = LLMConnectionError(

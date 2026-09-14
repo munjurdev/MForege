@@ -149,13 +149,20 @@ async def run_setup_wizard() -> None:
     print("   [3] OpenAI  paid API (uses OPENAI_API_KEY)")
     print("   [4] Custom  any OpenAI-compatible endpoint")
     print()
-    choice = (input("  Choose 1-4 [1]: ").strip() or "1")
+    try:
+        choice = (input("  Choose 1-4 [1]: ").strip() or "1")
+    except (EOFError, KeyboardInterrupt):
+        print("\n[!] No interactive terminal — run `mforege --setup` in a real terminal to configure.")
+        sys.exit(1)
 
     if choice == "2":
         lines = ["LLM_BACKEND=ollama", "LLM_MODEL=llama3"]
         print("\n  Ollama selected — make sure it's running (`ollama serve`).")
     elif choice == "3":
-        key = getpass.getpass("  Paste your OPENAI_API_KEY (hidden): ").strip()
+        try:
+            key = getpass.getpass("  Paste your OPENAI_API_KEY (hidden): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            key = ""
         if not key:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
@@ -163,9 +170,13 @@ async def run_setup_wizard() -> None:
         key = await _validate_or_reask(key, "", model, "openai", "OPENAI_API_KEY")
         lines = ["LLM_BACKEND=openai", f"OPENAI_API_KEY={key}", f"LLM_MODEL={model}"]
     elif choice == "4":
-        key = getpass.getpass("  Paste your API key (hidden): ").strip()
-        base = (input(f"  Base URL [{GROQ_BASE_URL}]: ").strip() or GROQ_BASE_URL)
-        model = input("  Model: ").strip()
+        try:
+            key = getpass.getpass("  Paste your API key (hidden): ").strip()
+            base = (input(f"  Base URL [{GROQ_BASE_URL}]: ").strip() or GROQ_BASE_URL)
+            model = input("  Model: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            key = ""
+            base, model = "", ""
         if not key or not model:
             print("  [!] Key and model are required — setup cancelled.")
             sys.exit(1)
@@ -173,7 +184,10 @@ async def run_setup_wizard() -> None:
         lines = ["LLM_BACKEND=custom", f"API_KEY={key}", f"BASE_URL={base}", f"LLM_MODEL={model}"]
     else:
         print("\n  Get a FREE key at https://console.groq.com (no credit card needed).")
-        key = getpass.getpass("  Paste your Groq API key (gsk_..., hidden): ").strip()
+        try:
+            key = getpass.getpass("  Paste your Groq API key (gsk_..., hidden): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            key = ""
         if not key:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
@@ -199,6 +213,171 @@ async def run_setup_wizard() -> None:
     print("  It works from every folder. A ./.env in the current folder")
     print("  can override it anytime. Re-run `mforege --setup` to change it.")
     print()
+
+
+COLORS_DIM = "\033[2m"
+COLORS_RESET = "\033[0m"
+
+
+def _pc(text: str, color: str = "", end: str = "\n") -> None:
+    """Plain-CLI colored print (never raises)."""
+    try:
+        print(f"{color}{text}{COLORS_RESET}", end=end, flush=True)
+    except Exception:
+        pass
+
+
+async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
+                        search_tool) -> None:
+    """Classic line-by-line chat — the --plain fallback.
+
+    Uses only input()/print(): works in every terminal, SSH session, and
+    piped script. Same commands as the full-screen UI.
+    """
+    # confirm callback on stdin — attach to the already-registered tools
+    async def confirm_action(action: str) -> bool:
+        _pc(f"\n[?] MForege wants to:\n{action}", "\033[93m")
+        try:
+            ans = input("    Allow? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        return ans in ("y", "yes")
+
+    from app.tools.system_tools import (
+        RunCommandTool, CreateFileTool, EditFileTool,
+    )
+    for tool in agent.tools.list():
+        if isinstance(tool, (RunCommandTool, CreateFileTool, EditFileTool)):
+            tool._confirm = confirm_action
+
+    def render_activity(event: str, detail: str) -> None:
+        if event == "tool_start":
+            _pc(f"  · {detail}", COLORS_DIM, end="")
+        elif event == "tool_end":
+            color = "\033[92m" if "✓" in detail else "\033[91m"
+            _pc(f" {detail}", color)
+        elif event == "round":
+            _pc(f"  ── round {detail} ──", COLORS_DIM)
+
+    agent.on_activity = render_activity
+
+    def render_notify(event: str, detail: str) -> None:
+        if event == "diff":
+            _pc("  ✓ Applied:", "\033[92m")
+            for ln in detail.split("\n"):
+                c = "\033[92m" if ln.startswith("+") else (
+                    "\033[91m" if ln.startswith("-") else COLORS_DIM)
+                _pc("  " + ln, c)
+        elif event == "cmd":
+            _pc(f"  $ {detail}", COLORS_DIM)
+
+    notify_hook.callback = render_notify
+
+    # header
+    _pc("=" * 56)
+    _pc("MForege — your personal AI agent (plain mode)", "\033[92m\033[1m")
+    _pc(f"backend: {args.backend} │ model: {args.model}", "\033[96m")
+    _pc(f"workspace: {workspace}", "\033[96m")
+
+    name = agent.long_term_memory.guess_name()
+    fact_count = agent.long_term_memory.count
+    if name:
+        _pc(f"Welcome back, {name}! 👋", "\033[92m")
+    elif fact_count:
+        _pc("Welcome back! 👋", "\033[92m")
+    else:
+        _pc("Nice to meet you! 👋 I'm MForege.", "\033[92m")
+    if not search_tool.is_configured:
+        _pc("[i] Optional: web search is off (free Exa key at dashboard.exa.ai).", COLORS_DIM)
+    _pc("Type /help for commands. exit or Ctrl+C to quit.\n", COLORS_DIM)
+
+    async def handle(text: str) -> None:
+        low = text.lower().strip()
+        if text.startswith("/"):
+            slash = text.split()[0].lower()
+            if slash == "/help":
+                _pc("[Commands]")
+                for cmd, desc in [
+                    ("/plan", "Show the current mission plan"),
+                    ("/tools", "List registered tools"),
+                    ("/memory", "Show what MForege remembers"),
+                    ("/forget", "Wipe long-term memory"),
+                    ("/clear", "Reset conversation"),
+                    ("/exit", "Quit"),
+                ]:
+                    _pc(f"  {cmd:<10} {desc}", COLORS_DIM)
+                return
+            if slash == "/plan":
+                rendered = plan_state.render()
+                _pc(rendered if rendered else "No active plan.", "\033[95m")
+                return
+            text = slash[1:]
+            low = text.lower()
+        if low in ("exit", "quit"):
+            _pc("Goodbye! 👋", "\033[92m")
+            raise SystemExit(0)
+        if low == "clear":
+            agent.clear_memory()
+            _pc("[*] Conversation cleared", "\033[92m")
+            return
+        if low == "memory":
+            facts = agent.long_term_memory.all()
+            if facts:
+                _pc(f"[Memory] ({len(facts)} facts):")
+                for i, f in enumerate(facts, 1):
+                    _pc(f"   {i}. {f}")
+            else:
+                _pc("[Memory] Nothing remembered yet.", COLORS_DIM)
+            return
+        if low in ("forget", "forget all", "forget everything"):
+            agent.clear_long_term_memory()
+            _pc("[*] Long-term memory wiped.", "\033[92m")
+            return
+        if low == "tools":
+            _pc("[Tools]:")
+            for t in agent.tools.list():
+                _pc(f"   - {t.name}", COLORS_DIM)
+            return
+
+        _pc("MForege: ", "\033[96m\033[1m")
+        try:
+            response = await agent.chat(text, stream=True)
+            if hasattr(response, "__aiter__"):
+                async for chunk in response:
+                    _pc(chunk, "", end="")
+                _pc("")
+            else:
+                _pc(response)
+        except Exception as e:
+            _pc(f"[!] {e}", "\033[91m")
+        status = plan_state.progress_line()
+        if status:
+            _pc(status, "\033[95m")
+        _pc("")
+
+    try:
+        while True:
+            try:
+                line = input("You: ")
+            except (EOFError, KeyboardInterrupt):
+                _pc("\nGoodbye! 👋", "\033[92m")
+                break
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                await handle(text)
+            except SystemExit:
+                break
+    finally:
+        try:
+            await agent.flush_memory()
+        except Exception:
+            pass
+        try:
+            await agent.llm.client.close()
+        except Exception:
+            pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -233,10 +412,26 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
                         help="Project folder MForege may read/write (default: current directory)")
     parser.add_argument("--setup", action="store_true",
                         help="Re-run the one-time setup wizard (choose backend, save API key)")
+    parser.add_argument("--version", action="store_true",
+                        help="Show the installed mforege version and exit")
+    parser.add_argument("--plain", action="store_true",
+                        help="Classic line-by-line chat (no full-screen UI) — use if the "
+                             "fancy input box doesn't accept your keyboard in this terminal")
     return parser
 
 
 async def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+
+    # --help / --version must win over everything (especially the interactive
+    # wizard — CI and scripts call mforege --help with no stdin)
+    if "-h" in argv or "--help" in argv:
+        _build_parser().parse_args(argv)  # prints help and exits 0
+        return
+    if "--version" in argv:
+        print(f"mforege {__version__}")
+        return
+
     # First pass: detect --setup before config-dependent defaults exist
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--setup", action="store_true")
@@ -320,7 +515,23 @@ async def main(argv: list[str] | None = None) -> None:
 
     search_tool = ExaSearchTool()
 
-    # ── UI ────────────────────────────────────────────────────────────
+    # Register tools BEFORE either UI branch — both modes need them.
+    # The plain CLI passes its own async confirm (stdin y/n); the full UI
+    # overrides with its question-bar callback.
+    agent.register_tools(
+        CalculatorTool(),
+        TimeTool(),
+        search_tool,
+        *create_system_tools(workspace=workspace, confirm=None,
+                             plan_state=plan_state, notify=notify_hook),
+    )
+
+    # ── UI or --plain fallback ───────────────────────────────────────
+    if getattr(args, "plain", False):
+        await run_plain_cli(agent, args, workspace, plan_state, notify_hook,
+                            search_tool)
+        return
+
     base_status = f"{args.model} │ {workspace}"
     ui = ChatUI(status_text=base_status)
 
@@ -329,15 +540,12 @@ async def main(argv: list[str] | None = None) -> None:
     if update_banner:
         ui.append(update_banner, style="class:warn")
 
-    # Confirmation happens in the UI question bar (async, deadlock-free:
-    # tools now await async confirm callbacks on the same running loop).
+    # The full UI re-registers the system tools with its question-bar
+    # confirm (async, deadlock-free: tools await async callbacks).
     async def confirm_action(action: str) -> bool:
         return await ui.confirm(action)
 
     agent.register_tools(
-        CalculatorTool(),
-        TimeTool(),
-        search_tool,
         *create_system_tools(workspace=workspace, confirm=confirm_action,
                              plan_state=plan_state, notify=notify_hook),
     )
@@ -380,17 +588,17 @@ async def main(argv: list[str] | None = None) -> None:
     name = agent.long_term_memory.guess_name()
     fact_count = agent.long_term_memory.count
     if not search_tool.is_configured:
-        ui.append("[!] Web search disabled — set EXA_API_KEY in .env to enable it",
+        ui.append("[i] Optional: web search is off. Get a free Exa key at https://dashboard.exa.ai",
+                  style="class:warn")
+        ui.append("    and add EXA_API_KEY=... to ~/.mforege/.env to enable it. Everything else works.",
                   style="class:warn")
     ui.append("  MForege — your personal AI agent ✦", style="class:title")
     ui.append(f"  backend: {args.backend} │ model: {args.model}", style="class:dim")
     ui.append(f"  workspace: {workspace}", style="class:dim")
     if name:
-        ui.append(f"  Welcome back, {name}! 👋  (I remember {fact_count} "
-                  f"thing{'s' if fact_count != 1 else ''})", style="class:ok")
+        ui.append(f"  Welcome back, {name}! 👋", style="class:ok")
     elif fact_count:
-        ui.append(f"  Welcome back! 👋  (I remember {fact_count} "
-                  f"thing{'s' if fact_count != 1 else ''})", style="class:ok")
+        ui.append("  Welcome back! 👋", style="class:ok")
     else:
         ui.append("  Nice to meet you! 👋 I'm MForege.", style="class:ok")
     ui.append("  /help for commands. Enter=send, Shift+Enter=newline, Ctrl+C=quit.",
