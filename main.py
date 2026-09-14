@@ -367,7 +367,7 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
                   f"thing{'s' if fact_count != 1 else ''})", style="class:ok")
     else:
         ui.append("  Nice to meet you! 👋 I'm MForege.", style="class:ok")
-    ui.append("  /help for commands. Enter=send, Alt+Enter=newline, Ctrl+C=quit.",
+    ui.append("  /help for commands. Enter=send, Shift+Enter=newline, Ctrl+C=quit.",
               style="class:dim")
     ui.append("")
 

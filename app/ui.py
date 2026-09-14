@@ -97,6 +97,11 @@ class ChatUI:
             if text:
                 self._queue.put_nowait(text)
 
+        # Shift+Enter = newline. prompt_toolkit exposes this as ControlJ:
+        # many terminals (Windows Terminal, VS Code, iTerm2, WezTerm) report
+        # Shift+Enter as the same escape sequence as Ctrl+J (\x0a or ESC+[13;2u).
+        # Alt+Enter and ESC-then-Enter are kept as universal fallbacks.
+        @kb.add("c-j")
         @kb.add("escape", "enter")
         def _(event):
             self.input.buffer.insert_text("\n")
@@ -192,7 +197,7 @@ class ChatUI:
     # ── status ────────────────────────────────────────────────────────
 
     def _status_fragments(self):
-        return [("class:status", f" ◆ MForege │ {self._status} │ /help │ Enter=send │ Alt+Enter=newline │ Ctrl+C=quit ")]
+        return [("class:status", f" ◆ MForege │ {self._status} │ /help │ Enter=send │ Shift+Enter=newline │ Ctrl+C=quit ")]
 
     # ── transcript rendering (colored, auto-scroll tail) ─────────────
 

@@ -99,7 +99,8 @@ For Groq: grab a free key at https://console.groq.com (no credit card).
   transcript after the edit lands
 - **Plan statusline** — `[Plan 2/5] next: write the test` after each reply
 - **Status bar** — model, workspace, and shortcut hints always visible
-- **Keys** — Enter sends, Alt+Enter adds a newline, Ctrl+C quits
+- **Keys** — Enter sends, Shift+Enter adds a newline (Alt+Enter also
+  works), Ctrl+C quits
 - **Slash commands** — `/help`, `/plan`, `/tools`, `/memory`, `/forget`,
   `/clear`, `/exit`
 
