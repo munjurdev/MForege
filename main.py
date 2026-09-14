@@ -16,6 +16,7 @@ Supports multiple backends:
 
 import asyncio
 import argparse
+import getpass
 import os
 import sys
 
@@ -44,23 +45,106 @@ def cprint_err(text: str) -> None:
 
 
 # ── .env resolution ────────────────────────────────────────────────
-# `mforege` can be launched from ANY directory (e.g., the user's Django
-# project). decouple normally only reads ./.env from the current working
-# directory — fall back to MForege's own .env (next to main.py).
+# `mforege` can be launched from ANY directory. Settings resolve in order:
+#   1. ./.env            (current folder — per-project override)
+#   2. ~/.mforege/.env   (global config written by the setup wizard)
+#   3. <MForege repo>/.env (developer install)
 _MFOREGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 try:
     _root_config = Config(RepositoryEnv(os.path.join(_MFOREGE_ROOT, ".env")))
 except Exception:
     _root_config = None
 
+_HOME_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mforege", ".env")
+_home_config = None
+
+
+def _load_home_config() -> None:
+    global _home_config
+    if os.path.exists(_HOME_CONFIG_PATH):
+        try:
+            _home_config = Config(RepositoryEnv(_HOME_CONFIG_PATH))
+        except Exception:
+            _home_config = None
+
+
+_load_home_config()
+
 
 def env_config(key: str, default: str = "") -> str:
-    """Read settings: workspace .env first, then MForege's own .env."""
+    """Read settings: current .env → ~/.mforege/.env → MForege's own .env."""
     if os.path.exists(".env"):
         return _cwd_config(key, default=default)
+    if _home_config is not None:
+        return _home_config(key, default=default)
     if _root_config is not None:
         return _root_config(key, default=default)
     return default
+
+
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
+
+def run_setup_wizard() -> None:
+    """One-time guided setup (freebuff-style): pick a brain, paste a key, done."""
+    print()
+    print("=" * 58)
+    print("  Welcome to MForege!  One-time setup (about 30 seconds)")
+    print("=" * 58)
+    print()
+    print("  Where should MForege get its brain?")
+    print("   [1] Groq    free cloud API — fastest option (recommended)")
+    print("   [2] Ollama  free, 100% local (needs https://ollama.com installed)")
+    print("   [3] OpenAI  paid API (uses OPENAI_API_KEY)")
+    print("   [4] Custom  any OpenAI-compatible endpoint")
+    print()
+    choice = (input("  Choose 1-4 [1]: ").strip() or "1")
+
+    if choice == "2":
+        lines = ["LLM_BACKEND=ollama", "LLM_MODEL=llama3"]
+        print("\n  Ollama selected — make sure it's running (`ollama serve`).")
+    elif choice == "3":
+        key = getpass.getpass("  Paste your OPENAI_API_KEY (hidden): ").strip()
+        if not key:
+            print("  [!] No key entered — setup cancelled.")
+            sys.exit(1)
+        model = (input("  Model [gpt-4o-mini]: ").strip() or "gpt-4o-mini")
+        lines = ["LLM_BACKEND=openai", f"OPENAI_API_KEY={key}", f"LLM_MODEL={model}"]
+    elif choice == "4":
+        key = getpass.getpass("  Paste your API key (hidden): ").strip()
+        base = (input(f"  Base URL [{GROQ_BASE_URL}]: ").strip() or GROQ_BASE_URL)
+        model = input("  Model: ").strip()
+        if not key or not model:
+            print("  [!] Key and model are required — setup cancelled.")
+            sys.exit(1)
+        lines = ["LLM_BACKEND=custom", f"API_KEY={key}", f"BASE_URL={base}", f"LLM_MODEL={model}"]
+    else:
+        print("\n  Get a FREE key at https://console.groq.com (no credit card needed).")
+        key = getpass.getpass("  Paste your Groq API key (gsk_..., hidden): ").strip()
+        if not key:
+            print("  [!] No key entered — setup cancelled.")
+            sys.exit(1)
+        model = (input("  Model [openai/gpt-oss-20b]: ").strip() or "openai/gpt-oss-20b")
+        lines = [
+            "LLM_BACKEND=custom",
+            f"API_KEY={key}",
+            f"BASE_URL={GROQ_BASE_URL}",
+            f"LLM_MODEL={model}",
+        ]
+
+    try:
+        os.makedirs(os.path.dirname(_HOME_CONFIG_PATH), exist_ok=True)
+        with open(_HOME_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        cprint_err(f"[!] Could not save config: {e}")
+        sys.exit(1)
+
+    _load_home_config()
+    print(f"\n  Done! Config saved to {_HOME_CONFIG_PATH}")
+    print("  It works from every folder. A ./.env in the current folder")
+    print("  can override it anytime. Re-run `mforege --setup` to change it.")
+    print()
 
 
 async def main(argv: list[str] | None = None) -> None:
@@ -91,7 +175,21 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
     parser.add_argument("--base-url", default=env_config("BASE_URL", default=""))
     parser.add_argument("--workspace", default=env_config("WORKSPACE", default="."),
                         help="Project folder MForege may read/write (default: current directory)")
+    parser.add_argument("--setup", action="store_true",
+                        help="Re-run the one-time setup wizard (choose backend, save API key)")
     args = parser.parse_args()
+
+    # Settings resolve: ./.env → ~/.mforege/.env → repo .env. If the user has
+    # configured nothing anywhere, launch the guided setup (freebuff-style).
+    _no_config = not (
+        os.path.exists(".env")
+        or os.path.exists(_HOME_CONFIG_PATH)
+        or os.path.exists(os.path.join(_MFOREGE_ROOT, ".env"))
+    )
+    if args.setup or _no_config:
+        run_setup_wizard()
+        if args.setup:  # explicit --setup: exit after saving
+            return
 
     # Resolve and validate the workspace early (human decides the sandbox root)
     workspace = os.path.abspath(args.workspace)

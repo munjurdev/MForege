@@ -28,6 +28,25 @@ Or straight from source:
 pip install git+https://github.com/munjurdev/MForege.git
 ```
 
+### First run — guided setup
+
+No config files needed. The first `mforege` launches a 30-second wizard:
+
+```
+Where should MForege get its brain?
+  [1] Groq    free cloud API — fastest option (recommended)
+  [2] Ollama  free, 100% local (needs https://ollama.com installed)
+  [3] OpenAI  paid API
+  [4] Custom  any OpenAI-compatible endpoint
+```
+
+Pick one, paste your key (hidden input), done — config is saved to
+`~/.mforege/.env` and works from **every** folder, forever. A `./.env` in
+the current folder can override it for one project. Change your mind later
+with `mforege --setup`.
+
+For Groq: grab a free key at https://console.groq.com (no credit card).
+
 ## Features
 
 ### Agent core
