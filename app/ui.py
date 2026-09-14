@@ -56,8 +56,8 @@ class ChatUI:
             wrap_lines=True,
         )
 
-        # Input box
-        self.input = TextArea(height=3, multiline=True, wrap_lines=True)
+        # Input box — grows with content (1–5 rows), via dynamic height callable
+        self.input = TextArea(height=self._input_height, multiline=True, wrap_lines=True)
 
         self.input_label = Window(
             content=FormattedTextControl(
@@ -155,16 +155,32 @@ class ChatUI:
 
         self.app: Application = Application(**app_kwargs)
 
+    # ── input sizing ─────────────────────────────────────────────────
+
+    MIN_INPUT_ROWS = 1
+    MAX_INPUT_ROWS = 5
+
+    def _input_height(self) -> int:
+        """Dynamic height: 1 row + extra lines typed, capped at MAX_INPUT_ROWS."""
+        try:
+            lines = self.input.text.count("\n") + 1
+        except Exception:
+            return self.MIN_INPUT_ROWS
+        return max(self.MIN_INPUT_ROWS, min(self.MAX_INPUT_ROWS, lines))
+
     # ── transcript ────────────────────────────────────────────────────
 
     def append(self, text: str, end: str = "\n", style: str | None = None) -> None:
-        """Append text (optionally styled) to the transcript."""
-        if not self._lines:
-            self._lines.append([])
-        self._lines[-1].append((style or "", text))
-        if end == "\n":
-            self._lines.append([])
-        self.app.invalidate()
+        """Append text (optionally styled) to the transcript. Never raises."""
+        try:
+            if not self._lines:
+                self._lines = [[]]
+            self._lines[-1].append((style or "", text))
+            if end == "\n":
+                self._lines.append([])
+            self.app.invalidate()
+        except Exception:
+            pass  # display must never break the chat
 
     def clear(self) -> None:
         self._lines = [[]]
