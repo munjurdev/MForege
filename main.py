@@ -70,17 +70,19 @@ async def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # With Groq (free):
-    python main.py
+  # With Groq (free API key at https://console.groq.com):
+    mforege --backend custom --base-url https://api.groq.com/openai/v1
 
-  # With Ollama (local):
-    python main.py --backend ollama --model llama3
+  # With Ollama (free, local — no API key needed):
+    mforege --backend ollama --model llama3
 
   # With OpenAI:
-    OPENAI_API_KEY=sk-xxx python main.py
+    OPENAI_API_KEY=sk-xxx mforege
 
   # Work inside a specific project folder:
-    python main.py --workspace "C:\\path\\to\\project"
+    mforege --workspace "C:\\path\\to\\project"
+
+Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, BASE_URL=..., LLM_MODEL=...).
         """,
     )
     parser.add_argument("--backend", choices=["openai", "ollama", "custom"],
@@ -99,19 +101,25 @@ Examples:
         sys.exit(1)
 
     # Get API key based on backend
+    cmd = "mforege"
     api_key: str | None
     if args.backend == "openai":
         api_key = env_config("OPENAI_API_KEY", default="")
         if not api_key:
             cprint_err("[!] OpenAI backend requires OPENAI_API_KEY")
-            cprint_err("    Or use the free local backend: python main.py --backend ollama")
+            cprint_err(f"    Put it in a .env file (OPENAI_API_KEY=sk-...) or run: {cmd} --backend ollama  (free, local)")
             sys.exit(1)
     elif args.backend == "ollama":
         api_key = None
     elif args.backend == "custom":
         api_key = env_config("API_KEY", default="")
         if not api_key:
-            cprint_err("[!] Custom backend requires API_KEY")
+            cprint_err("[!] Custom backend requires API_KEY (e.g., a free Groq key from https://console.groq.com)")
+            cprint_err("    Put it in a .env file next to where you run the command:")
+            cprint_err("        API_KEY=gsk_...")
+            cprint_err("        BASE_URL=https://api.groq.com/openai/v1")
+            cprint_err("        LLM_BACKEND=custom")
+            cprint_err("        LLM_MODEL=openai/gpt-oss-20b")
             sys.exit(1)
     else:
         api_key = None
