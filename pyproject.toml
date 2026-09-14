@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mforege"
+version = "0.1.0"
+description = "MForege — a personal AI agent CLI with tools, memory, and an IDE-style terminal UI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Munjur" }]
+requires-python = ">=3.10"
+keywords = [
+    "ai", "agent", "cli", "assistant", "llm",
+    "openai", "ollama", "groq", "tools", "chatbot",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "openai==3.13.0",
+    "python-decouple==3.8",
+    "exa-py==2.20.0",
+    "prompt_toolkit==3.0.53",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/munjurdev/MForege"
+Repository = "https://github.com/munjurdev/MForege"
+Issues = "https://github.com/munjurdev/MForege/issues"
+Changelog = "https://github.com/munjurdev/MForege/releases"
+
+[project.scripts]
+mforege = "main:cli"
+
+[tool.setuptools]
+packages = ["app", "app.agent", "app.llm", "app.tools"]
+py-modules = ["main"]
