@@ -1,10 +1,11 @@
-"""Tests for the PyPI update checker (all network paths are mocked)"""
+"""Tests for the PyPI update checker and the wizard's key-validation ping"""
 import json
 import os
 
 import pytest
 
 import app.update_check as uc
+from app.llm.client import LLMClient, LLMAuthError, LLMConnectionError
 
 
 @pytest.fixture(autouse=True)
@@ -146,3 +147,43 @@ class TestCache:
         assert uc.check_for_update("0.1.1", force=True) is None
         # cached "same version" -> None without network
         assert uc.check_for_update("0.1.1") is None
+
+
+class TestWizardPing:
+    """The setup wizard validates keys with LLMClient.ping() before saving."""
+
+    @pytest.mark.asyncio
+    async def test_ping_success_is_silent(self, monkeypatch):
+        import asyncio
+
+        async def fake_create(self, **kwargs):
+            assert kwargs["max_tokens"] == 1
+            return object()
+
+        monkeypatch.setattr(LLMClient, "create_chat_completion", fake_create)
+        client = LLMClient(backend="custom", api_key="k", base_url="http://x/v1", model="m")
+        await asyncio.wait_for(client.ping(), timeout=1)  # returns None, no raise
+
+    @pytest.mark.asyncio
+    async def test_ping_bad_key_raises_auth_error(self, monkeypatch):
+        import asyncio
+
+        async def fake_create(self, **kwargs):
+            raise LLMAuthError("API key rejected by custom backend.")
+
+        monkeypatch.setattr(LLMClient, "create_chat_completion", fake_create)
+        client = LLMClient(backend="custom", api_key="bad", base_url="http://x/v1", model="m")
+        with pytest.raises(LLMAuthError):
+            await client.ping()
+
+    @pytest.mark.asyncio
+    async def test_ping_unreachable_backend_raises_connection_error(self, monkeypatch):
+        import asyncio
+
+        async def fake_create(self, **kwargs):
+            raise LLMConnectionError("Could not connect to custom backend.")
+
+        monkeypatch.setattr(LLMClient, "create_chat_completion", fake_create)
+        client = LLMClient(backend="custom", api_key="k", base_url="http://x/v1", model="m")
+        with pytest.raises(LLMConnectionError):
+            await client.ping()

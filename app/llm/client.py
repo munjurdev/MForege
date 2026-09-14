@@ -147,3 +147,17 @@ class LLMClient:
         if self.backend == "custom":
             return f"Could not connect to custom backend at '{self.base_url}'. Check the base URL."
         return f"Could not connect to the OpenAI API: {e}"
+
+    async def ping(self) -> None:
+        """
+        Verify the key/model/endpoint with a tiny real request.
+
+        Raises the friendly LLM* errors on failure; returns None on success.
+        Used by the setup wizard so a bad key never gets saved.
+        """
+        await self.create_chat_completion(
+            model=self.model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0,
+        )

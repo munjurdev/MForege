@@ -36,8 +36,11 @@ from app.tools.system_tools import create_system_tools, PlanState, NotifyHook
 from app.ui import ChatUI
 from app.update_check import check_for_update
 from app.llm.client import (
+    LLMClient,
     LLMAuthError,
     LLMConnectionError,
+    LLMRateLimitError,
+    LLMResponseError,
 )
 
 
@@ -87,6 +90,41 @@ def env_config(key: str, default: str = "") -> str:
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
+def _validate_or_reask(key: str, base_url: str, model: str, backend: str,
+                       label: str, max_tries: int = 3) -> str:
+    """Ping the backend with the pasted key; re-ask on failure. Returns the key."""
+    tries = 0
+    while True:
+        print(f"  Verifying {label} with a tiny test call...", flush=True)
+        try:
+            async def _attempt():
+                client = LLMClient(
+                    backend=backend, api_key=key, base_url=base_url or None, model=model,
+                )
+                try:
+                    await client.ping()
+                finally:
+                    # close the HTTP pool inside the SAME event loop, or httpx
+                    # complains 'Event loop is closed' during GC
+                    try:
+                        await client.client.close()
+                    except Exception:
+                        pass
+            asyncio.run(_attempt())
+            print("  ✓ Key works!\n")
+            return key
+        except (LLMAuthError, LLMConnectionError, LLMRateLimitError, LLMResponseError) as e:
+            tries += 1
+            print(f"  ✗ That key didn't work: {e}")
+            if tries >= max_tries:
+                print("  [!] Three failed attempts — saving nothing. Run `mforege --setup` to try again.")
+                sys.exit(1)
+            key = getpass.getpass(f"  Paste your {label} again (hidden): ").strip()
+            if not key:
+                print("  [!] No key entered — setup cancelled.")
+                sys.exit(1)
+
+
 def run_setup_wizard() -> None:
     """One-time guided setup (freebuff-style): pick a brain, paste a key, done."""
     print()
@@ -111,6 +149,7 @@ def run_setup_wizard() -> None:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
         model = (input("  Model [gpt-4o-mini]: ").strip() or "gpt-4o-mini")
+        key = _validate_or_reask(key, "", model, "openai", "OPENAI_API_KEY")
         lines = ["LLM_BACKEND=openai", f"OPENAI_API_KEY={key}", f"LLM_MODEL={model}"]
     elif choice == "4":
         key = getpass.getpass("  Paste your API key (hidden): ").strip()
@@ -119,6 +158,7 @@ def run_setup_wizard() -> None:
         if not key or not model:
             print("  [!] Key and model are required — setup cancelled.")
             sys.exit(1)
+        key = _validate_or_reask(key, base, model, "custom", "API key")
         lines = ["LLM_BACKEND=custom", f"API_KEY={key}", f"BASE_URL={base}", f"LLM_MODEL={model}"]
     else:
         print("\n  Get a FREE key at https://console.groq.com (no credit card needed).")
@@ -127,6 +167,7 @@ def run_setup_wizard() -> None:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
         model = (input("  Model [openai/gpt-oss-20b]: ").strip() or "openai/gpt-oss-20b")
+        key = _validate_or_reask(key, GROQ_BASE_URL, model, "custom", "Groq API key")
         lines = [
             "LLM_BACKEND=custom",
             f"API_KEY={key}",
