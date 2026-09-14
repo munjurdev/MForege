@@ -201,7 +201,9 @@ async def run_setup_wizard() -> None:
     print()
 
 
-async def main(argv: list[str] | None = None) -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Called AFTER config resolution so defaults like
+    LLM_BACKEND/LLM_MODEL reflect what the setup wizard just saved."""
     parser = argparse.ArgumentParser(
         prog="mforege",
         description="MForege — your personal AI agent",
@@ -231,19 +233,32 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
                         help="Project folder MForege may read/write (default: current directory)")
     parser.add_argument("--setup", action="store_true",
                         help="Re-run the one-time setup wizard (choose backend, save API key)")
-    args = parser.parse_args()
+    return parser
 
-    # Settings resolve: ./.env → ~/.mforege/.env → repo .env. If the user has
-    # configured nothing anywhere, launch the guided setup (freebuff-style).
+
+async def main(argv: list[str] | None = None) -> None:
+    # First pass: detect --setup before config-dependent defaults exist
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--setup", action="store_true")
+    pre_args, _ = pre.parse_known_args(argv)
+
     _no_config = not (
         os.path.exists(".env")
         or os.path.exists(_HOME_CONFIG_PATH)
         or os.path.exists(os.path.join(_MFOREGE_ROOT, ".env"))
     )
-    if args.setup or _no_config:
+    if pre_args.setup or _no_config:
         await run_setup_wizard()
-        if args.setup:  # explicit --setup: exit after saving
-            return
+        if pre_args.setup:
+            # explicit --setup: relaunch main() so backend/model/base-url are
+            # re-read from the freshly saved config, then continue into chat
+            print("\n  Starting MForege with your new settings… (Ctrl+C to exit)")
+            return await main(argv=[])
+        # First-run wizard (no --setup flag): fall through and build the real
+        # parser now — env_config() will see the config the wizard just saved.
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     # Resolve and validate the workspace early (human decides the sandbox root)
     workspace = os.path.abspath(args.workspace)
