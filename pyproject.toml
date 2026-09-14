@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "MForege — a personal AI agent CLI with tools, memory, and an IDE-style terminal UI"
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "Munjur" }]
+authors = [{ name = "Munjur Alom", email = "munjuralom.devs@gmail.com" }]
 requires-python = ">=3.10"
 keywords = [
     "ai", "agent", "cli", "assistant", "llm",
@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.4.2", "build", "twine"]
+dev = ["pytest==8.4.2", "pytest-asyncio>=1.0", "build", "twine"]
 
 [project.urls]
 Homepage = "https://github.com/munjurdev/MForege"
