@@ -803,8 +803,14 @@ class ChatUI:
         except Exception:
             pass  # display must never break the chat
 
-    def append(self, text: str, end: str = "\n", style: str | None = None) -> None:
-        """Append text (optionally styled) to the transcript. Never raises."""
+    def append(self, text: str, *, end: str = "\n", style: str | None = None) -> None:
+        """Append text (optionally styled) to the transcript. Never raises.
+
+        end/style are KEYWORD-ONLY by design: ui.append("x", "class:dim")
+        used to bind the style into `end`, silently dropping the newline
+        (real bug seen in the wild). Now misuse raises TypeError loudly
+        instead of corrupting the transcript quietly.
+        """
         try:
             seg = None
             if self._segments:

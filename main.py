@@ -957,8 +957,8 @@ async def main(argv: list[str] | None = None) -> None:
         ui.append("    and add EXA_API_KEY=... to ~/.mforege/.env to enable it. Everything else works.",
                   style="class:warn")
     if os.environ.get("TERM_PROGRAM") == "vscode":
-        ui.append("[i] VS Code: Shift+Enter needs a one-time keybinding — /vscode-hint", "class:dim")
-        ui.append("    Use Alt+Enter meanwhile.", "class:dim")
+        ui.append("[i] VS Code: Shift+Enter needs a one-time keybinding — /vscode-hint", style="class:dim")
+        ui.append("    Use Alt+Enter meanwhile.", style="class:dim")
 
     # ── Codebuff-parity slash commands ────────────────────────────
     async def handle_buffuff_command(user_input: str) -> None:
