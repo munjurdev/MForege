@@ -74,12 +74,17 @@ class ConversationMemory:
         kept_other = other_msgs[-keep_count:] if keep_count > 0 else []
         self.messages = system_msgs + kept_other
         
-    def token_estimate(self) -> int:
-        """Rough token count (chars/4 heuristic — good enough for a meter)."""
+    def token_estimate(self, extra: int = 0) -> int:
+        """Rough token count (chars/4 heuristic — good enough for a meter).
+
+        `extra` lets callers add fixed overhead (system prompt + tool
+        schemas) so the estimate reflects the WHOLE request, not just
+        history — that's what rate limits actually measure.
+        """
         total = sum(len(m.content) for m in self.messages)
         if self.summary:
             total += len(self.summary)
-        return total // 4
+        return (total + extra) // 4
 
     def maybe_condense(self, context_window: int) -> bool:
         """
@@ -111,6 +116,32 @@ class ConversationMemory:
 
         keep_count = max(0, self.max_messages - len(system_msgs))
         self.messages = system_msgs + other_msgs[-self.KEEP_RECENT:][-keep_count:]
+        return True
+
+    def force_condense(self, keep_recent: int = 4, clip: int = 100) -> bool:
+        """Emergency fold: like maybe_condense but aggressive.
+
+        Used when the backend rejects a request for being too large — folds
+        everything except the newest `keep_recent` messages into the summary,
+        with shorter clips, until the request fits. Returns True if anything
+        was folded.
+        """
+        system_msgs = [m for m in self.messages if m.role == "system"]
+        other_msgs = [m for m in self.messages if m.role != "system"]
+        if len(other_msgs) <= keep_recent:
+            return False
+
+        fold = other_msgs[:-keep_recent]
+        lines = []
+        for m in fold:
+            tag = {"user": "User", "tool": "Tool"}.get(m.role, "MForege")
+            text = " ".join(m.content.split())
+            if text:
+                lines.append(f"- {tag}: {text[:clip]}")
+        if lines:
+            self.summary = (self.summary + "\n" if self.summary else "") + "\n".join(lines)
+
+        self.messages = system_msgs + other_msgs[-keep_recent:]
         return True
 
     def get(self, role: Optional[str] = None, limit: Optional[int] = None) -> List[Message]:

@@ -177,6 +177,32 @@ BASE_URL=https://api.groq.com/openai/v1
 LLM_MODEL=llama-3.1-8b-instant
 ```
 
+**OpenRouter (one free key → 20+ free models)**:
+
+```
+API_KEY=sk-or-...
+BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=deepseek/deepseek-r1:free
+```
+
+### Switching models live
+
+MForege ships a curated free-model catalog (Groq, OpenRouter `:free`, Ollama,
+OpenAI) defined in one place — `app/models.py`. Add or remove a model by
+editing one `Model(...)` line there; every menu picks it up automatically.
+
+Switch mid-conversation — history is kept, and the choice persists:
+
+```
+/model            # list models for your provider
+/model 2          # pick by menu number
+/model kimi       # pick by short name
+/model openai/gpt-oss-120b         # or paste any model id
+```
+
+The switch applies to your next message. `mforege --setup` also offers the
+catalog (and OpenRouter) instead of a bare model prompt.
+
 ### Web search (optional)
 
 1. Get a free API key at https://dashboard.exa.ai
@@ -220,6 +246,7 @@ you launch it. Workspace defaults to the current directory.
 | `/resume` | Resume the most recent chat (or `/resume <id>`) |
 | `/bash <cmd>` | Run a shell command with the agent's safety guards |
 | `/byok`  | Show where to configure your API key / model |
+| `/model` | Switch model live (`/model 2`, `/model kimi`, or an id) |
 | `/interview` | Guided Q&A to spec a task before building |
 | `/diagnostics` | Version, model, context usage, sessions |
 | `/review` | Review changes made this conversation      |

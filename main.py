@@ -35,6 +35,7 @@ from app.agent.tools import CalculatorTool, TimeTool
 from app.tools import ExaSearchTool
 from app.tools.system_tools import create_system_tools, PlanState, NotifyHook
 from app.ui import ChatUI, boxed
+from app import models as model_catalog
 from app.update_check import check_for_update
 from app.llm.client import (
     LLMClient,
@@ -91,6 +92,71 @@ def env_config(key: str, default: str = "") -> str:
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
+# ── /model command (shared by plain + UI modes) ────────────────────
+
+def _run_model_command(arg: str, agent) -> list:
+    """Handle '/model [token]' → list of (text, kind) output lines.
+
+    kinds: title | dim | ok | error. Performs the switch + persistence
+    itself so both CLI modes stay behaviorally identical.
+    """
+    provider = model_catalog.provider_for_current(agent.config.model)
+    out: list = []
+    if not arg or arg == "list":
+        out.append((f"[Models] {model_catalog.PROVIDERS[provider].label} — /model <#> or /model <name>:", "title"))
+        for ln in model_catalog.render_menu(provider, current=agent.config.model):
+            out.append((ln, "dim"))
+        out.append(("   → /model 2   /model kimi   /model openai/gpt-oss-120b", "dim"))
+        return out
+
+    model, ambiguous = model_catalog.resolve(arg, provider)
+    if model is None and ambiguous:
+        names = ", ".join(m.name for m in ambiguous)
+        out.append((f"[Models] '{arg}' matches several — be specific: {names}", "error"))
+        return out
+    if model is None:
+        out.append((f"[Models] No model #{arg} — run /model to see the list.", "error"))
+        return out
+    if model.id == agent.config.model:
+        out.append((f"[Models] Already on {model.id}.", "dim"))
+        return out
+    try:
+        agent.switch_model(model.id)
+        _persist_model(model.id)
+    except Exception as e:
+        out.append((f"[Models] Switch failed: {e}", "error"))
+        return out
+    out.append((f"[Models] Switched to {model.id} ✓ (next message uses it)", "ok"))
+    return out
+
+
+def _persist_model(model: str) -> None:
+    """Save the chosen model to ~/.mforege/.env so it survives restarts.
+
+    Rewrites just the LLM_MODEL line (or appends it); never touches keys.
+    Best-effort: a read-only config file must not break a model switch.
+    """
+    try:
+        lines: list[str] = []
+        if os.path.exists(_HOME_CONFIG_PATH):
+            with open(_HOME_CONFIG_PATH, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        found = False
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("LLM_MODEL="):
+                lines[i] = f"LLM_MODEL={model}"
+                found = True
+                break
+        if not found:
+            lines.append(f"LLM_MODEL={model}")
+        os.makedirs(os.path.dirname(_HOME_CONFIG_PATH), exist_ok=True)
+        with open(_HOME_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        _load_home_config()  # pick up the new value immediately
+    except Exception:
+        pass
+
+
 def _mask_key(key: str) -> str:
     """'gsk_abcdefghijklmnopqrstuvwxyz12' -> 'gsk_ab••••••••••••zy12'
 
@@ -137,6 +203,25 @@ async def _validate_or_reask(key: str, base_url: str, model: str, backend: str,
             print(f"  Received: {_mask_key(key)} ({len(key)} chars — hidden for safety)")
 
 
+def _choose_model(provider: str) -> str:
+    """Show the provider's catalog; user picks a number, a short name,
+    any model id, or presses Enter for the default."""
+    default = model_catalog.default_for(provider)
+    if model_catalog.models_for(provider):
+        print("\n  Pick a model:")
+        for ln in model_catalog.render_menu(provider, current=""):
+            print(ln)
+    try:
+        raw = input(f"  Model number/name/id [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    model, _amb = model_catalog.resolve(raw, provider)
+    if model is None:
+        print(f"  [!] No model '{raw}' — using {default}.")
+        return default
+    return model.id
+
+
 async def run_setup_wizard() -> None:
     """One-time guided setup (freebuff-style): pick a brain, paste a key, done."""
     print()
@@ -145,21 +230,23 @@ async def run_setup_wizard() -> None:
     print("=" * 58)
     print()
     print("  Where should MForege get its brain?")
-    print("   [1] Groq    free cloud API — fastest option (recommended)")
-    print("   [2] Ollama  free, 100% local (needs https://ollama.com installed)")
-    print("   [3] OpenAI  paid API (uses OPENAI_API_KEY)")
-    print("   [4] Custom  any OpenAI-compatible endpoint")
+    print("   [1] Groq        free cloud API — fastest (recommended)")
+    print("   [2] OpenRouter  free — ONE key unlocks 20+ free models")
+    print("   [3] Ollama      free, 100% local (needs https://ollama.com)")
+    print("   [4] OpenAI      paid API (uses OPENAI_API_KEY)")
+    print("   [5] Custom      any OpenAI-compatible endpoint")
     print()
     try:
-        choice = (input("  Choose 1-4 [1]: ").strip() or "1")
+        choice = (input("  Choose 1-5 [1]: ").strip() or "1")
     except (EOFError, KeyboardInterrupt):
         print("\n[!] No interactive terminal — run `mforege --setup` in a real terminal to configure.")
         sys.exit(1)
 
-    if choice == "2":
-        lines = ["LLM_BACKEND=ollama", "LLM_MODEL=llama3"]
+    if choice == "3":
+        model = _choose_model("ollama")
+        lines = ["LLM_BACKEND=ollama", f"LLM_MODEL={model}"]
         print("\n  Ollama selected — make sure it's running (`ollama serve`).")
-    elif choice == "3":
+    elif choice == "4":
         try:
             key = getpass.getpass("  Paste your OPENAI_API_KEY (hidden): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -167,10 +254,10 @@ async def run_setup_wizard() -> None:
         if not key:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
-        model = (input("  Model [gpt-4o-mini]: ").strip() or "gpt-4o-mini")
+        model = _choose_model("openai")
         key = await _validate_or_reask(key, "", model, "openai", "OPENAI_API_KEY")
         lines = ["LLM_BACKEND=openai", f"OPENAI_API_KEY={key}", f"LLM_MODEL={model}"]
-    elif choice == "4":
+    elif choice == "5":
         try:
             key = getpass.getpass("  Paste your API key (hidden): ").strip()
             base = (input(f"  Base URL [{GROQ_BASE_URL}]: ").strip() or GROQ_BASE_URL)
@@ -183,8 +270,28 @@ async def run_setup_wizard() -> None:
             sys.exit(1)
         key = await _validate_or_reask(key, base, model, "custom", "API key")
         lines = ["LLM_BACKEND=custom", f"API_KEY={key}", f"BASE_URL={base}", f"LLM_MODEL={model}"]
+    elif choice == "2":
+        provider = model_catalog.PROVIDERS["openrouter"]
+        print(f"\n  Get a FREE key at {provider.key_url} — one key unlocks")
+        print("  every ':free' model (Llama, DeepSeek, Qwen, Gemma, Mistral...).")
+        try:
+            key = getpass.getpass(f"  Paste your {provider.key_label} (hidden): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            key = ""
+        if not key:
+            print("  [!] No key entered — setup cancelled.")
+            sys.exit(1)
+        model = _choose_model("openrouter")
+        key = await _validate_or_reask(key, provider.base_url, model, "custom", "OpenRouter API key")
+        lines = [
+            "LLM_BACKEND=custom",
+            f"API_KEY={key}",
+            f"BASE_URL={provider.base_url}",
+            f"LLM_MODEL={model}",
+        ]
     else:
-        print("\n  Get a FREE key at https://console.groq.com (no credit card needed).")
+        provider = model_catalog.PROVIDERS["groq"]
+        print(f"\n  Get a FREE key at {provider.key_url} (no credit card needed).")
         try:
             key = getpass.getpass("  Paste your Groq API key (gsk_..., hidden): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -192,12 +299,12 @@ async def run_setup_wizard() -> None:
         if not key:
             print("  [!] No key entered — setup cancelled.")
             sys.exit(1)
-        model = (input("  Model [openai/gpt-oss-20b]: ").strip() or "openai/gpt-oss-20b")
-        key = await _validate_or_reask(key, GROQ_BASE_URL, model, "custom", "Groq API key")
+        model = _choose_model("groq")
+        key = await _validate_or_reask(key, provider.base_url, model, "custom", "Groq API key")
         lines = [
             "LLM_BACKEND=custom",
             f"API_KEY={key}",
-            f"BASE_URL={GROQ_BASE_URL}",
+            f"BASE_URL={provider.base_url}",
             f"LLM_MODEL={model}",
         ]
 
@@ -257,6 +364,8 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
         elif event == "tool_end":
             color = "\033[92m" if "✓" in detail else "\033[91m"
             _pc(f" {detail}", color)
+        elif event == "adapting":
+            _pc(f"  ↻ {detail}", "\033[95m")
         elif event == "round":
             _pc(f"  ── round {detail} ──", COLORS_DIM)
 
@@ -360,6 +469,7 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
                     ("/resume", "Resume the most recent chat"),
                     ("/bash", "Run a shell command with the agent's safety guards"),
                     ("/byok", "Show where to configure your API key / model"),
+                    ("/model", "Switch model live (/model 2 or /model <id>)"),
                     ("/queue", "Message queueing info"),
                     ("/interview", "Guided Q&A to spec a task before building"),
                     ("/feedback", "Share feedback about MForege"),
@@ -452,6 +562,14 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
             _pc("    Set OPENAI_API_KEY / base_url / model (any OpenAI-compatible", COLORS_DIM)
             _pc("    endpoint works, including a free Groq key). A ./.env in the", COLORS_DIM)
             _pc("    current folder overrides it. Or rerun: mforege --setup", COLORS_DIM)
+            return
+        if low == "model" or low.startswith("model "):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            colors = {"title": "\033[96m", "dim": COLORS_DIM,
+                      "ok": "\033[92m", "error": "\033[91m"}
+            for line, kind in _run_model_command(arg, agent):
+                _pc(line, colors.get(kind, ""))
             return
         if low == "feedback":
             _pc("[Feedback] MForege is your project — ideas go straight to the", "\033[96m")
@@ -779,6 +897,8 @@ async def main(argv: list[str] | None = None) -> None:
                 ui.set_activity(None)
             elif event == "round":
                 ui.append(f"  ── round {detail} ──", style="class:dim")
+            elif event == "adapting":
+                ui.append(f"  ↻ {detail}", style="class:warn")
             elif event == "reasoning":
                 # Streamed thinking tokens → live italic "Thinking" block,
                 # replaced in place until the first real answer token.
@@ -911,6 +1031,15 @@ async def main(argv: list[str] | None = None) -> None:
             agent.config.reasoning_effort = level
             ui.append(f"[Reasoning] Set to {level}.", style="class:ok")
             return
+        if slash == "/model":
+            parts = user_input.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            styles = {"title": "class:title", "dim": "class:dim",
+                      "ok": "class:ok", "error": "class:error"}
+            for line, kind in _run_model_command(arg, agent):
+                ui.append(line, style=styles.get(kind, ""))
+            refresh_context_meter()
+            return
         if slash == "/queue":
             ui.append("[Queue] Message queueing is not needed — MForege processes", style="class:dim")
             ui.append("   each message immediately; send after the reply lands.", style="class:dim")
@@ -1010,7 +1139,8 @@ async def main(argv: list[str] | None = None) -> None:
                 return
             if slash in ("/diagnostics", "/review", "/copy", "/export",
                          "/theme:toggle", "/reasoning", "/queue", "/new",
-                         "/history", "/bash", "/byok", "/feedback", "/interview"):
+                         "/history", "/bash", "/byok", "/feedback", "/interview",
+                         "/model"):
                 await handle_buffuff_command(user_input)
                 return
             if slash == "/plan":

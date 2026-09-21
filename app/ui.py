@@ -63,6 +63,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/bash", "Run a shell command with the agent's safety guards"),
     ("/theme:toggle", "Toggle between light and dark mode"),
     ("/byok", "Show where to configure your API key / model"),
+    ("/model", "Switch model live (free catalog: Groq, OpenRouter, Ollama)"),
     ("/reasoning", "Set how hard the model thinks (low / high / max)"),
     ("/resume", "Resume a recent chat (default: latest)"),
     ("/sessions", "List past conversations"),

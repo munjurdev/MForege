@@ -19,12 +19,25 @@ from typing import Optional, AsyncGenerator, Any, Callable, List, Dict, Tuple, U
 from pydantic import BaseModel
 
 from ..llm import LLMClient
+from ..llm.client import LLMRequestTooLargeError, LLMRateLimitError
 from .memory import ConversationMemory, Message
 from .tools import Tool, ToolRegistry
 
 # How many model<->tool round trips a single chat() call may make by default
 # (configurable per-agent via AgentConfig.max_tool_rounds or MAX_TOOL_ROUNDS env)
 MAX_TOOL_ROUNDS = 10
+
+# Adaptive sizing when a backend rejects a request for being too large
+# (Groq free tier: ~8000 TPM shared by prompt + completion + tools overhead).
+# max_tokens shrinks by this factor per retry, floor at MIN_MAX_TOKENS.
+TOO_LARGE_SHRINK = 0.5
+MIN_MAX_TOKENS = 512
+
+# Fixed per-request overhead estimate (chars): system prompt + tool schemas
+# + JSON scaffolding. The Groq 413 in the field (~8161 requested vs 8000 TPM
+# limit while the old meter showed 1%) proved history-only counting lies.
+# Measured: system prompt ~8.5K chars + schemas ~4.5K chars + slack.
+REQUEST_OVERHEAD_CHARS = 16000
 
 
 class AgentConfig(BaseModel):
@@ -87,6 +100,11 @@ create_file, edit_file, search_code, glob_files.
   short clarifying question or propose sensible defaults and ask "shall I proceed?". NEVER invent
   details and act on them silently.
 - Prefer list_files/read_file to ground answers in the actual project before guessing.
+- Scaffolding projects: prefer the official scaffolder via run_command when one exists
+  (`django-admin startproject`, `npm create vite@latest`, `cargo new`, ...) — one command
+  instead of dozens of hand-written files. Hand-write only the files the scaffolder
+  doesn't create. This is faster AND keeps requests small (providers rate-limit tokens
+  per minute; giant file dumps can hit the limit mid-mission).
 - Use create_file for new files (small plan first for big scaffolds); use edit_file for existing
   ones — read the file first, then replace an exact unique snippet.
 - Every write/edit asks the user for confirmation — that's by design, don't try to bypass it
@@ -132,6 +150,10 @@ class Agent:
         self.memory = ConversationMemory()
         self.tools = ToolRegistry()
         self.on_activity: Optional[Callable[[str, str], None]] = None  # (event, detail) -> UI hook
+        # Learned from 413s: max_tokens and condensed-context hint for the
+        # rest of the session so later requests pre-shrink instead of failing.
+        self._max_tokens_cap: Optional[int] = None
+        self._condense_hint = False
 
     def _emit(self, event: str, detail: str = "") -> None:
         """Notify the UI of agent activity (tool calls, rounds). Never raises."""
@@ -231,29 +253,109 @@ class Agent:
     def _tools_schema(self) -> Optional[List[Dict]]:
         return self.tools.to_openai_schema() if self.tools.tools else None
 
+    def _overhead_tokens(self) -> int:
+        """Estimated tokens of system prompt + tool schemas + message
+        scaffolding — the fixed cost every request pays before history."""
+        schema = self._tools_schema()
+        chars = len(self.config.system_prompt or "")
+        chars += len(json.dumps(schema)) if schema else 0
+        return chars // 4 + 1000  # +1K slack for per-message JSON framing
+
     def context_usage(self) -> tuple[int, int]:
-        """(estimated tokens in next request, model context window size)."""
-        return self.memory.token_estimate(), self.config.context_window
+        """(estimated tokens in next request, model context window size).
+
+        Counts system prompt + tool schemas too — history-only estimates
+        under-reported so badly that a real 413 happened at "ctx 1%".
+        """
+        return self.memory.token_estimate() + self._overhead_tokens(), self.config.context_window
+
+    def _effective_max_tokens(self) -> int:
+        cap = self._max_tokens_cap or self.config.max_tokens
+        return max(MIN_MAX_TOKENS, min(cap, self.config.max_tokens))
+
+    # ── Adaptive retry on "request too large" ────────────
+
+    def _pre_shrink(self) -> None:
+        """Before sending: if a previous 413 taught us limits, apply them."""
+        if self._condense_hint:
+            self.memory.force_condense()
+        self.memory.maybe_condense(self.config.context_window)
+
+    async def _send_with_recovery(self, call_kwargs: dict, rebuild_messages: Optional[Callable[[], List[Dict]]] = None) -> Any:
+        """Send a completion request; on 413, adapt and retry — like an
+        agent that hits a rate limit: condense context, shrink max_tokens,
+        wait out the TPM window if told to, then try again (max 3 adapts).
+
+        `rebuild_messages` is called after a condense so the retry actually
+        ships the smaller history (the caller's list is updated in place).
+
+        Raises the original error if adaptation is exhausted — the user
+        sees an honest message instead of a silent failure.
+        """
+        attempts = 0
+        while True:
+            try:
+                return await self.llm.create_chat_completion(**call_kwargs)
+            except LLMRequestTooLargeError as e:
+                attempts += 1
+                if attempts > 3:
+                    raise
+                # 1) shrink the completion budget
+                old_cap = self._max_tokens_cap or self.config.max_tokens
+                new_cap = max(MIN_MAX_TOKENS, int(old_cap * TOO_LARGE_SHRINK))
+                improved = new_cap < old_cap
+                self._max_tokens_cap = new_cap
+                # 2) fold older context into the summary
+                condensed = self.memory.force_condense()
+                if condensed:
+                    self._condense_hint = True
+                    if rebuild_messages is not None:
+                        call_kwargs["messages"][:] = rebuild_messages()
+                self._emit("adapting", (
+                    f"request too large for the model's rate limit "
+                    f"(limit {e.limit_tokens or '?'}, requested {e.requested_tokens or '?'}) — "
+                    + ("condensing context, " if condensed else "")
+                    + (f"shrinking output budget to {new_cap}, " if improved else "")
+                    + "retrying"
+                ))
+                if e.retry_after:
+                    await asyncio.sleep(min(e.retry_after, 20.0))
+                if not improved and not condensed:
+                    raise
+                call_kwargs["max_tokens"] = self._effective_max_tokens()
+            except LLMRateLimitError as e:
+                attempts += 1
+                if attempts > 3:
+                    raise
+                wait = getattr(e, "retry_after", None) or 20.0
+                self._emit("adapting", f"rate limited — waiting {wait:.0f}s, then retrying")
+                await asyncio.sleep(min(wait, 30.0))
 
     # ── Non-streaming path ─────────────────────────────
     async def _get_response(self) -> str:
         """Run the tool loop until the model produces a final text answer"""
+        self._pre_shrink()
         messages = self._build_api_messages()
-        # Auto-condense BEFORE sending if approaching the context window
-        self.memory.maybe_condense(self.config.context_window)
+        base_len = len(messages)  # in-flight suffix (tool rounds) survives a rebuild
         tools_schema = self._tools_schema()
+
+        def _rebuild():
+            return self._build_api_messages() + messages[base_len:]
 
         for round_num in range(1, self.config.max_tool_rounds + 1):
             if round_num > 1:
                 self._emit("round", f"{round_num}/{self.config.max_tool_rounds}")
-            response = await self.llm.create_chat_completion(
-                model=self.config.model,
-                messages=messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                tools=tools_schema,
-                tool_choice="auto" if tools_schema else None,
-                config=self.config,
+            response = await self._send_with_recovery(
+                {
+                    "model": self.config.model,
+                    "messages": messages,
+                    "temperature": self.config.temperature,
+                    "max_tokens": self._effective_max_tokens(),
+                    "tools": tools_schema,
+                    "tool_choice": "auto" if tools_schema else None,
+                    "config": self.config,
+                },
+                rebuild_messages=_rebuild,
             )
 
             msg = response.choices[0].message
@@ -284,12 +386,15 @@ class Agent:
             messages.extend(tool_results)
 
         # Model kept requesting tools past the limit; force a final answer
-        response = await self.llm.create_chat_completion(
-            model=self.config.model,
-            messages=messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            config=self.config,
+        response = await self._send_with_recovery(
+            {
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": self._effective_max_tokens(),
+                "config": self.config,
+            },
+            rebuild_messages=lambda: self._build_api_messages() + messages[base_len:],
         )
         content = response.choices[0].message.content or ""
         self.memory.add(Message(role="assistant", content=content))
@@ -305,10 +410,14 @@ class Agent:
         streamed completion is started; the generator yields the final
         text answer (streamed chunk by chunk).
         """
+        self._pre_shrink()
         messages = self._build_api_messages()
-        # Auto-condense BEFORE sending if approaching the context window
-        self.memory.maybe_condense(self.config.context_window)
+        base_len = len(messages)
         tools_schema = self._tools_schema()
+
+        def _rebuild():
+            return self._build_api_messages() + messages[base_len:]
+
         full_content = ""
         saved = False
 
@@ -316,15 +425,18 @@ class Agent:
             for round_num in range(1, self.config.max_tool_rounds + 1):
                 if round_num > 1:
                     self._emit("round", f"{round_num}/{self.config.max_tool_rounds}")
-                response = await self.llm.create_chat_completion(
-                    model=self.config.model,
-                    messages=messages,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                    stream=True,
-                    tools=tools_schema,
-                    tool_choice="auto" if tools_schema else None,
-                    config=self.config,
+                response = await self._send_with_recovery(
+                    {
+                        "model": self.config.model,
+                        "messages": messages,
+                        "temperature": self.config.temperature,
+                        "max_tokens": self._effective_max_tokens(),
+                        "stream": True,
+                        "tools": tools_schema,
+                        "tool_choice": "auto" if tools_schema else None,
+                        "config": self.config,
+                    },
+                    rebuild_messages=_rebuild,
                 )
 
                 round_content = ""
@@ -454,3 +566,24 @@ class Agent:
     def set_system_prompt(self, prompt: str) -> None:
         """Update the system prompt (applies to the next chat call)"""
         self.config.system_prompt = prompt
+
+    def switch_model(self, model: str) -> None:
+        """Switch to a different model at runtime (like a model picker).
+
+        Applies to the NEXT message — conversation history is untouched,
+        so mid-mission switches keep full context. Also resets the 413
+        recovery cap, since the new model may have different limits.
+        """
+        model = (model or "").strip()
+        if not model:
+            raise ValueError("model id is required")
+        self.config.model = model
+        self.llm.model = model
+        self._max_tokens_cap = None
+
+    async def aclose(self) -> None:
+        """Release the HTTP connection pool (best-effort)."""
+        try:
+            await self.llm.client.close()
+        except Exception:
+            pass

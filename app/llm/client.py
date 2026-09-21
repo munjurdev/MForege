@@ -33,6 +33,35 @@ MAX_RETRIES = 2
 RETRY_BASE_DELAY = 1.0
 
 
+def _parse_int(text: str) -> Optional[int]:
+    """First integer found in `text`, else None."""
+    import re
+    m = re.search(r"\d+", text or "")
+    return int(m.group()) if m else None
+
+
+def _extract_retry_after(e: Exception) -> Optional[float]:
+    """Retry-After header value in seconds, when the provider sends one."""
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate_limit_message(e: Exception) -> str:
+    """Human message from a RateLimitError, incl. TPM details when present."""
+    body = getattr(e, "body", None)
+    detail = ""
+    if isinstance(body, dict):
+        detail = str(body.get("error", {}).get("message", "")) if isinstance(body.get("error"), dict) else str(body)
+    if not detail:
+        detail = str(getattr(e, "message", "") or e)
+    return detail
+
+
 class LLMAuthError(Exception):
     """API key missing or rejected"""
 
@@ -45,8 +74,52 @@ class LLMRateLimitError(Exception):
     """Rate limit / quota exceeded"""
 
 
+class LLMRequestTooLargeError(Exception):
+    """Request exceeded a size/token limit (HTTP 413).
+
+    Carries what the backend reported so the agent can adapt:
+    limit_tokens / requested_tokens are set when the provider states them
+    (Groq: "Limit 8000, Requested 8161 ... tokens per minute").
+    """
+
+    def __init__(self, message: str, limit_tokens: Optional[int] = None,
+                 requested_tokens: Optional[int] = None,
+                 retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.limit_tokens = limit_tokens
+        self.requested_tokens = requested_tokens
+        self.retry_after = retry_after
+
+
 class LLMResponseError(Exception):
     """Backend returned an unexpected error response"""
+
+
+def _too_large_message(e: Exception) -> LLMRequestTooLargeError:
+    """Build LLMRequestTooLargeError from an APIStatusError with status 413."""
+    body = getattr(e, "body", None)
+    detail = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message", ""))
+    if not detail:
+        detail = str(getattr(e, "message", "") or e)
+
+    limit = requested = None
+    up = detail.upper()
+    if "LIMIT" in up and "REQUESTED" in up:
+        # Groq style: "Limit 8000, Requested 8161 ... tokens per minute"
+        try:
+            limit = _parse_int(detail.split("Limit")[1].split(",")[0])
+            requested = _parse_int(detail.split("Requested")[1].split(",")[0])
+        except (IndexError, ValueError):
+            pass
+    return LLMRequestTooLargeError(
+        f"Request too large for this model/plan: {detail}",
+        limit_tokens=limit, requested_tokens=requested,
+        retry_after=_extract_retry_after(e),
+    )
 
 
 class LLMClient:
@@ -137,14 +210,28 @@ class LLMClient:
                     f"API key rejected by {self.backend} backend. Check your key and try again."
                 ) from e
             except RateLimitError as e:
+                # 429 with a token detail that says "too large" is really a
+                # size problem (Groq does this on TPM overage) — surface it
+                # as 413 so the agent can shrink instead of blind-retrying.
+                msg = _rate_limit_message(e)
+                up = msg.upper()
+                if "TOO LARGE" in up or "REQUEST TOO LARGE" in up:
+                    raise _too_large_message(e) from e
+                wait = _extract_retry_after(e)
                 last_error = LLMRateLimitError(
-                    f"Rate limit reached on {self.backend} backend: {e.message if hasattr(e, 'message') else e}"
+                    f"Rate limit reached on {self.backend} backend: {msg}"
+                    + (f" (retry after {wait:.0f}s)" if wait else ""),
                 )
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(wait if wait else RETRY_BASE_DELAY * (2 ** attempt))
+                continue
             except InternalServerError as e:
                 last_error = LLMResponseError(
                     f"{self.backend} backend had an internal error (server side). Retrying may help."
                 )
             except APIStatusError as e:
+                if getattr(e, "status_code", None) == 413:
+                    raise _too_large_message(e) from e
                 raise LLMResponseError(
                     f"{self.backend} backend returned error {e.status_code}: "
                     f"{e.message if hasattr(e, 'message') else e}"
