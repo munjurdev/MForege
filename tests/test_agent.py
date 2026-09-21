@@ -200,6 +200,107 @@ class TestNonStreamingToolLoop:
         assert "tools" not in calls[-1] or calls[-1].get("tools") is None
 
 
+class TestCooperativeStop:
+    """Esc-to-stop: cooperative cancellation flag checked before every
+    model call, after each streamed chunk, and between tool rounds."""
+
+    @pytest.mark.asyncio
+    async def test_stop_before_first_call_skips_model(self):
+        agent = make_agent()
+        calls = []
+
+        async def fake_completion(**kwargs):
+            calls.append(kwargs)
+            return make_response(content="never")
+
+        agent.llm.create_chat_completion = fake_completion
+        agent.request_stop()
+        result = await agent.chat("hi")
+
+        assert result == ""
+        assert calls == []  # no request left the machine
+
+    @pytest.mark.asyncio
+    async def test_stop_between_tool_rounds(self):
+        agent = make_agent()
+        calls = []
+        events = []
+
+        async def fake_completion(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return make_response(tool_calls=[
+                    make_tool_call("c1", "calculator", json.dumps({"expression": "1+1"}))
+                ])
+            return make_response(content="should not happen")
+
+        agent.llm.create_chat_completion = fake_completion
+
+        def hook(event, detail):
+            events.append(event)
+            if event == "tool_end":
+                agent.request_stop()  # user pressed Esc while tools ran
+
+        agent.on_activity = hook
+        result = await agent.chat("loop")
+
+        assert result == ""
+        assert len(calls) == 1          # round 2 never called the model
+        assert "tool_end" in events
+        assert "stopped" in events      # UI is told why
+
+    @pytest.mark.asyncio
+    async def test_stream_stop_mid_stream_keeps_partial_answer(self):
+        agent = make_agent()
+
+        async def fake_stream(**kwargs):
+            async def gen():
+                delta = SimpleNamespace(content="Hel", tool_calls=None)
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+                agent._stop_requested = True  # Esc pressed mid-stream
+                delta = SimpleNamespace(content="lo", tool_calls=None)
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+            return gen()
+
+        agent.llm.create_chat_completion = fake_stream
+        agent.config.streaming = True
+
+        stream = await agent.chat("hi", stream=True)
+        chunks = [c async for c in stream]
+
+        assert chunks == ["Hel"]                      # nothing after the stop
+        assert agent.memory.messages[-1].content == "Hel"  # partial answer saved
+
+    @pytest.mark.asyncio
+    async def test_clear_stop_resets_flag(self):
+        agent = make_agent()
+        agent.request_stop()
+        agent._clear_stop()
+
+        async def fake_completion(**kwargs):
+            return make_response(content="back to work")
+
+        agent.llm.create_chat_completion = fake_completion
+        assert await agent.chat("hi") == "back to work"
+
+    @pytest.mark.asyncio
+    async def test_stop_flag_clears_after_firing(self):
+        """One Esc stops exactly one turn — a consumed stop must not
+        swallow the NEXT message too."""
+        agent = make_agent()
+        calls = []
+
+        async def fake_completion(**kwargs):
+            calls.append(kwargs)
+            return make_response(content="ok")
+
+        agent.llm.create_chat_completion = fake_completion
+        agent.request_stop()
+        assert await agent.chat("first") == ""     # fires once
+        assert await agent.chat("second") == "ok"  # flag self-cleared
+        assert len(calls) == 1
+
+
 class TestStreamingToolLoop:
     @pytest.mark.asyncio
     async def test_streamed_chunks_and_memory(self):

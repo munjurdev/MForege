@@ -154,6 +154,12 @@ class Agent:
         # rest of the session so later requests pre-shrink instead of failing.
         self._max_tokens_cap: Optional[int] = None
         self._condense_hint = False
+        # Cooperative cancellation (Esc): checked before every model call,
+        # after each streamed round, and between tool rounds — the
+        # in-flight call finishes and state unwinds cleanly instead of
+        # being abandoned mid-request.
+        self._stop_requested: bool = False
+        self._stop_reason_msg: str = ""
 
     def _emit(self, event: str, detail: str = "") -> None:
         """Notify the UI of agent activity (tool calls, rounds). Never raises."""
@@ -163,6 +169,33 @@ class Agent:
             self.on_activity(event, detail)
         except Exception:
             pass
+
+    # ── cooperative stop (Esc) ─────────────────────────────────────────
+
+    def request_stop(self, reason: str = "") -> None:
+        """Ask the agent to stop its current work (Esc key).
+
+        Cooperative: the loop checks the flag before every model call and
+        after each streamed round, so the in-flight call finishes and
+        state unwinds cleanly — no abandoned requests, no lost partial
+        answers.
+        """
+        self._stop_requested = True
+        if reason:
+            self._stop_reason_msg = reason
+
+    def _clear_stop(self) -> None:
+        """Reset the stop flag (start of a fresh turn)."""
+        self._stop_requested = False
+        self._stop_reason_msg = ""
+
+    def _stop_reason(self) -> str:
+        """Consume the stop: return the message and self-clear the flag,
+        so one Esc stops exactly one turn — never the next message."""
+        reason = self._stop_reason_msg or "Stopped — tell me what to do next."
+        self._stop_requested = False
+        self._stop_reason_msg = ""
+        return reason
 
     def add_tool(self, tool: Tool) -> None:
         """Register a tool for the agent to use"""
@@ -345,6 +378,9 @@ class Agent:
         for round_num in range(1, self.config.max_tool_rounds + 1):
             if round_num > 1:
                 self._emit("round", f"{round_num}/{self.config.max_tool_rounds}")
+            if self._stop_requested:  # Esc — stop before the next model call
+                self._emit("stopped", self._stop_reason())
+                return ""
             response = await self._send_with_recovery(
                 {
                     "model": self.config.model,
@@ -359,6 +395,10 @@ class Agent:
             )
 
             msg = response.choices[0].message
+
+            if self._stop_requested:  # Esc while the model was working
+                self._emit("stopped", self._stop_reason())
+                return ""
 
             if not msg.tool_calls:
                 content = msg.content or ""
@@ -425,6 +465,9 @@ class Agent:
             for round_num in range(1, self.config.max_tool_rounds + 1):
                 if round_num > 1:
                     self._emit("round", f"{round_num}/{self.config.max_tool_rounds}")
+                if self._stop_requested:  # Esc — stop before the next model call
+                    self._emit("stopped", self._stop_reason())
+                    return
                 response = await self._send_with_recovery(
                     {
                         "model": self.config.model,
@@ -446,6 +489,10 @@ class Agent:
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
+
+                    if self._stop_requested:  # Esc — stop before yielding more
+                        self._emit("stopped", self._stop_reason())
+                        return  # the finally-block persists the partial answer
 
                     # Reasoning tokens (Groq gpt-oss, DeepSeek-R1, etc.) →
                     # surfaced as events so the UI can render a live
@@ -474,6 +521,12 @@ class Agent:
                                     entry["arguments"] += tc_delta.function.arguments
 
                             # No tools requested -> this round is the final answer
+                if self._stop_requested:  # Esc mid-stream — keep the partial answer
+                    self._emit("stopped", self._stop_reason())
+                    if full_content:
+                        self.memory.add(Message(role="assistant", content=full_content))
+                        saved = True
+                    return
                 if not tool_calls:
                     self.memory.add(Message(role="assistant", content=full_content))
                     saved = True

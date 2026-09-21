@@ -1,33 +1,46 @@
 """
 Terminal UI for MForege
 =======================
-IDE-style chat layout using prompt_toolkit (always-running full-screen app):
+Agent-panel chat layout using prompt_toolkit (always-running full-screen app).
+The input box is the BOTTOM-MOST element — everything else sits above it
+(context/status info belongs above the composer, never under it):
 
     ┌─────────────────────────────────────┐
     │  transcript (colored, scrolls)      │
-    │  ...                                │
-    ├─ ✦ message ────────────────────────┤
-    │  > input box                        │
+    │   ✻ Thinking… (live, collapsible)   │
+    │   · tool(args) ✓ (0.3s)             │
+    │   ✓ Applied:  -old / +new           │
+    │   markdown reply (bold/code/bullet) │
     ├─────────────────────────────────────┤
-    │ ◆ status bar                        │
+    │  ✻ read_file(path=main.py)          │ activity (0–1 row)
+    │  /help  /plan …                     │ slash menu (0–6 rows)
+    │  ⚠ EDIT main.py? (y/n)              │ confirm (0–1 row)
+    │  ◆ model │ ctx │ ⏳ 3s (Esc=stop)   │ status (1 row)
+    ├─ ✻ message ────────────────────────┤
+    │  > input box   ← bottom-most row    │
     └─────────────────────────────────────┘
 
 Colors: You=green, Assistant=cyan, activity=dim, diffs=green/red,
-plan=magenta, thinking=italic gray, errors=red. The app runs continuously,
+plan=magenta, thinking=italic gray, errors=red, md-code=orange,
+md-header=bold blue, md-link=green underline. The app runs continuously,
 so tool activity appears live while the model works (same as an IDE panel).
 
 Transcript model (important): the transcript is a list of SEGMENTS, not a
-flat line list. Three segment kinds:
+flat line list. Four segment kinds:
   - "text"  — ordinary transcript lines (append)
   - "think" — the Thinking block; collapsible WITHOUT losing its content
   - "block" — named live blocks (TODOS) redrawn in place
+  - "md"    — a live markdown reply (begin_reply/stream_reply/end_reply);
+              re-rendered in place from raw text on every streamed chunk
 Because segments are variable-height objects, mutating one can never
 corrupt another (e.g. collapsing Thinking no longer wipes TODOS), and
 thinking text is preserved for later expansion.
 """
 
 import asyncio
+import re
 import sys
+import time
 from prompt_toolkit.application import Application
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import HTML
@@ -40,7 +53,100 @@ from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
 
-_THINK_SUMMARY = ("class:think", " ✦ thought for a moment — Ctrl+T expands")
+_THINK_HEADER = ("class:think", " ✻ Thinking…")
+_THINK_SUMMARY = ("class:think", " ✻ Thinking… (Ctrl+T expands)")
+
+_PHASE_PREFIX = "⏳"  # live phase timer in the status bar (thinking/responding)
+
+# ── Markdown rendering (assistant replies) ─────────────────────────────
+# Assistant output is markdown (bold, code, headers, lists — the same way
+# coding-agent replies are formatted). The renderer turns it into styled
+# terminal fragments: **bold** → bold, `x` → highlighted code, fenced
+# blocks → their own style, headers/bullets/quotes → clean terminal forms.
+_MD_INLINE_RE = re.compile(
+    r"(`[^`\n]+`"                    # inline code
+    r"|\*\*[^*\n]+\*\*"             # **bold**
+    r"|\*[^*\n]+\*"                 # *italic*
+    r"|\[[^\]\n]+\]\([^)\n]+\))"   # [text](url)
+)
+
+
+def _md_inline(text: str) -> list[tuple[str, str]]:
+    """Parse inline markdown (code/bold/italic/links) into styled fragments."""
+    frags: list[tuple[str, str]] = []
+    pos = 0
+    for m in _MD_INLINE_RE.finditer(text):
+        if m.start() > pos:
+            frags.append(("", text[pos:m.start()]))
+        tok = m.group(0)
+        if tok.startswith("`"):
+            frags.append(("class:md-code", tok[1:-1]))
+        elif tok.startswith("**"):
+            frags.append(("class:md-bold", tok[2:-2]))
+        elif tok.startswith("["):
+            try:
+                link_text, url = tok[1:-1].split("](", 1)
+            except ValueError:
+                frags.append(("", tok))
+            else:
+                frags.append(("class:md-link", link_text))
+                frags.append(("class:md-dim", f" ({url})"))
+        else:
+            frags.append(("class:md-italic", tok[1:-1]))
+        pos = m.end()
+    if pos < len(text):
+        frags.append(("", text[pos:]))
+    return frags
+
+
+def _render_markdown(text: str) -> list[list[tuple[str, str]]]:
+    """Render a markdown document into transcript lines (styled fragments).
+
+    Block-level pass (headers, lists, fenced code, quotes, rules) with
+    inline parsing for the rest. Idempotent: same input → same lines.
+    """
+    out: list[list[tuple[str, str]]] = []
+    in_code = False
+    for raw in text.split("\n"):
+        if in_code:
+            if raw.strip().startswith("```"):
+                in_code = False
+                out.append([("class:md-dim", raw.strip())])
+            else:
+                out.append([("class:md-code-block", raw)])
+            continue
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_code = True
+            out.append([("class:md-dim", stripped)])
+            continue
+        if not stripped:
+            out.append([])
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            style = "class:md-header" if len(m.group(1)) <= 2 else "class:md-subheader"
+            out.append([(style, m.group(2))])
+            continue
+        m = re.match(r"^(\s*)[-*+]\s+(.*)$", raw)
+        if m:
+            out.append([("class:md-bullet", f"{m.group(1)}• "),
+                        *(_md_inline(m.group(2)))])
+            continue
+        m = re.match(r"^(\s*)(\d+)[.)]\s+(.*)$", raw)
+        if m:
+            out.append([("class:md-bullet", f"{m.group(1)}{m.group(2)}. "),
+                        *(_md_inline(m.group(3)))])
+            continue
+        m = re.match(r"^>\s?(.*)$", stripped)
+        if m:
+            out.append([("class:md-quote", "▌ "), ("class:md-quote", m.group(1))])
+            continue
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", stripped):
+            out.append([("class:md-dim", "─" * 32)])
+            continue
+        out.append(_md_inline(raw))
+    return out
 
 _WHEEL_STEP = 3  # transcript lines per mouse-wheel notch
 
@@ -319,6 +425,18 @@ class ChatUI:
         self._last_line_count = 1      # for anchored scrolling compensation
         self._rendered_once = False    # anchor baseline set on first render
         self._activity: str | None = None  # "editing foo.py" pinned indicator
+        # Esc-to-stop: the UI never stops the agent itself — it records the
+        # request, calls the _on_stop hook (installed by main.py, flips the
+        # agent's cooperative flag) and cancels the handler task so the
+        # in-flight request unwinds at its next await point.
+        self._stop_requested = False
+        self._on_stop = None           # Callable[[], None] | None
+        self._handler_task: asyncio.Task | None = None
+        # Live markdown reply segment (None = no reply streaming right now)
+        self._md_seg: dict | None = None
+        # Live phase timer ("⏳ thinking 3s" in the status bar)
+        self._phase_label: str | None = None
+        self._phase_started: float | None = None
 
         # Transcript pane (colored fragments, scrollable via PgUp/PgDn
         # and the mouse wheel)
@@ -333,7 +451,7 @@ class ChatUI:
         # Input box — grows with content (1–5 rows), drawn inside a bordered
         # frame with the label embedded in the top border (IDE-style).
         self.input = TextArea(height=self._input_height, multiline=True, wrap_lines=True)
-        self.input_frame = Frame(self.input, title=" message ", style="class:inputbox")
+        self.input_frame = Frame(self.input, title=" ✻ message ", style="class:inputbox")
 
         # Slash-command popup (visible while typing a "/" prefix)
         self._menu_items: list[tuple[str, str]] = []
@@ -386,6 +504,7 @@ class ChatUI:
                 return
             text = text.strip()
             if text:
+                self.echo_submission(text)
                 self._queue.put_nowait(text)
 
         # Arrow keys navigate the popup when it is visible; otherwise they
@@ -403,6 +522,24 @@ class ChatUI:
             if self._menu_items:
                 self._menu_items = []
                 self._invalidate()
+                return
+            if self._question is not None:
+                # Esc cancels a pending confirmation (same as answering n)
+                self._answer = "n"
+                self._question = None
+                if self._answer_event:
+                    self._answer_event.set()
+                event.app.invalidate()
+                return
+            if self._phase_started is not None and not self.input.text:
+                # Esc while the agent is working → ask it to stop
+                self.request_stop()
+                event.app.invalidate()
+                return
+            if self.input.text:
+                # Standard terminal behavior: Esc clears the input line
+                self.input.text = ""
+                event.app.invalidate()
 
         # Newline in the input box:
         # - Shift+Enter: works in Windows Terminal / cmd / most Unix
@@ -482,15 +619,17 @@ class ChatUI:
         def _(event):
             self.scroll_bottom()
 
+        # Bottom stack — matches my panel: EVERYTHING sits ABOVE the input;
+        # the input box is the last row on screen, nothing below it
+        # (status/context info lives above the composer, not under it).
         layout = HSplit([
             self.transcript,
             Window(height=1, char="─", style="class:separator"),
             self.activity_win,
             self.menu_win,
-            self.input_frame,
-            self.question_win,
-            self.separator,
-            self.status_win,
+            self.question_win,   # confirm bar directly above the input
+            self.status_win,     # status/context above the input too
+            self.input_frame,    # input = bottom-most element
         ])
 
         app_kwargs = dict(
@@ -498,7 +637,9 @@ class ChatUI:
             key_bindings=kb,
             full_screen=True,
             style=Style.from_dict({
-                "separator": "#444444",
+                # md-* + core palette come from _DARK_STYLE (shared with
+                # /theme:toggle — one source of truth for both palettes)
+                **self._DARK_STYLE,
                 "scrollbar-track": "#444444",
                 "scrollbar-thumb": "bold #5fd7ff",
                 "label": "#5fd7ff",
@@ -526,6 +667,9 @@ class ChatUI:
             # + ScrollUp/Down bindings). Click-to-position stays handled by
             # the input's own control.
             mouse_support=True,
+            # Keeps the live phase timer ("⏳ thinking Ns") ticking even
+            # when nothing streams (long tool runs, silent model calls).
+            refresh_interval=1.0,
         )
         if output is not None:
             app_kwargs["output"] = output
@@ -607,12 +751,66 @@ class ChatUI:
 
     # ── transcript ────────────────────────────────────────────────────
 
+    def echo_submission(self, text: str) -> None:
+        """Echo the user's message AT SUBMIT TIME (chat-app style).
+
+        Multi-line pastes are indented so they don't render as one giant
+        green wall. Echoing here — not in the message handler — means a
+        message sent while the agent is still working appears immediately,
+        in order, instead of surfacing only when its turn starts.
+        """
+        try:
+            self.scroll_bottom()  # sending = want to see the fresh reply
+            lines = text.split("\n")
+            self.append(f"You: {lines[0]}", style="class:you")
+            for extra in lines[1:]:
+                self.append(f"    {extra}", style="class:you")
+        except Exception:
+            pass  # display must never break the chat
+
+    # ── live markdown reply (agent-style formatted output) ───────────
+
+    def begin_reply(self) -> None:
+        """Start a live markdown reply segment.
+
+        While active, stream_reply() appends raw markdown and the whole
+        segment re-renders in place — bold/code/headers/lists appear live,
+        exactly like watching an agent write its reply.
+        """
+        try:
+            self._md_seg = {"kind": "md", "text": "", "lines": []}
+            self._segments.append(self._md_seg)
+            self._invalidate()
+        except Exception:
+            pass  # display must never break the chat
+
+    def stream_reply(self, chunk: str) -> None:
+        """Append raw markdown to the open reply and re-render it live."""
+        try:
+            if self._md_seg is None:
+                self.begin_reply()
+            self._md_seg["text"] += chunk
+            self._md_seg["lines"] = _render_markdown(self._md_seg["text"])
+            self._invalidate()
+        except Exception:
+            pass  # display must never break the chat
+
+    def end_reply(self) -> None:
+        """Close the live reply segment (final render stays in the transcript)."""
+        try:
+            self._md_seg = None
+            self._invalidate()
+        except Exception:
+            pass  # display must never break the chat
+
     def append(self, text: str, end: str = "\n", style: str | None = None) -> None:
         """Append text (optionally styled) to the transcript. Never raises."""
         try:
             seg = None
             if self._segments:
                 last = self._segments[-1]
+                # Never merge into a live markdown segment — it re-renders
+                # itself from raw text; foreign appends go to a fresh seg.
                 if last["kind"] == "text":
                     seg = last
             if seg is None:
@@ -628,12 +826,68 @@ class ChatUI:
     def clear(self) -> None:
         self._segments = [_new_text_seg()]
         self._blocks = {}
+        self._md_seg = None
         self._scroll_offset = 0
         self._invalidate()
 
     def set_status(self, text: str) -> None:
         self._status = text
         self._invalidate()
+
+    # ── agent phase timer (live "⏳ thinking Ns") ─────────────────────
+
+    def set_phase(self, label: str | None) -> None:
+        """Mark the start/end of an agent phase ("thinking" / "responding").
+
+        While a phase is active the status bar shows a live elapsed timer
+        and Esc is armed to stop the agent. Passing another label mid-turn
+        (thinking → responding) KEEPS the clock running — one timer per
+        turn. Pass None when the turn ends.
+        """
+        if label:
+            if self._phase_started is None:
+                self._phase_started = time.monotonic()
+            self._phase_label = label
+        else:
+            self._phase_label = None
+            self._phase_started = None
+        self._invalidate()
+
+    @property
+    def phase_active(self) -> bool:
+        """True while the agent is mid-turn (timer running, Esc armed)."""
+        return self._phase_started is not None
+
+    # ── Esc-to-stop ──────────────────────────────────────────────────
+
+    def set_stop_hook(self, hook) -> None:
+        """Install the callback fired when the user presses Esc mid-turn
+        (main.py wires this to Agent.request_stop)."""
+        self._on_stop = hook
+
+    def request_stop(self) -> None:
+        """User pressed Esc: record it and stop the running turn.
+
+        Two mechanisms, belt and suspenders:
+        1. the _on_stop hook flips the agent's cooperative flag (graceful
+           unwinding, partial answers saved by the generator's finally),
+        2. the handler task is cancelled so an in-flight HTTP wait ends
+           immediately instead of at the next cooperative checkpoint.
+        The handler itself catches the CancelledError and prints the note,
+        so the worker loop survives and the next message still runs.
+        """
+        self._stop_requested = True
+        self.set_activity(None)
+        if self._on_stop is not None:
+            try:
+                self._on_stop()
+            except Exception:
+                self.append("[!] Stop failed — Ctrl+C still works.", style="class:error")
+        task = self._handler_task
+        if task is not None and not task.done():
+            task.cancel()
+        else:
+            self.set_status("stopped")
 
     def _invalidate(self) -> None:
         """Request a redraw — never raises (display must not break the chat)."""
@@ -676,6 +930,16 @@ class ChatUI:
     # ── light/dark theme toggle (/theme:toggle) ───────────────────
 
     _DARK_STYLE = {
+        "md-bold": "bold #ffffff",
+        "md-italic": "italic #d0d0d0",
+        "md-code": "#ff9d5c",
+        "md-code-block": "#e8e8e8",
+        "md-header": "bold #5fd7ff",
+        "md-subheader": "bold #87d7ff",
+        "md-bullet": "#5fd7ff",
+        "md-quote": "#af87ff",
+        "md-link": "#5fff87 underline",
+        "md-dim": "#6c6c6c",
         "separator": "#444444",
         "label": "#5fd7ff",
         "status": "bg:#1e6f5c #ffffff bold",
@@ -693,6 +957,16 @@ class ChatUI:
         "think": "italic #878787",
     }
     _LIGHT_STYLE = {
+        "md-bold": "bold #000000",
+        "md-italic": "italic #333333",
+        "md-code": "#b34700",
+        "md-code-block": "#222222",
+        "md-header": "bold #0052a3",
+        "md-subheader": "bold #3377bb",
+        "md-bullet": "#0052a3",
+        "md-quote": "#6633aa",
+        "md-link": "#007700 underline",
+        "md-dim": "#888888",
         "separator": "#bbbbbb",
         "label": "#0066cc",
         "status": "bg:#006633 #ffffff bold",
@@ -736,7 +1010,8 @@ class ChatUI:
                 if last["kind"] == "think" and not last.get("collapsed"):
                     seg = last
             if seg is None:
-                seg = {"kind": "think", "lines": [[]], "collapsed": False}
+                # header line + empty body line (tokens stream into the body)
+                seg = {"kind": "think", "lines": [[_THINK_HEADER], []], "collapsed": False}
                 self._segments.append(seg)
             self._write_lines(seg["lines"], token, "class:think")
             self._invalidate()
@@ -780,6 +1055,8 @@ class ChatUI:
             for seg in self._segments:
                 if seg["kind"] == "think":
                     for ln in seg["lines"]:
+                        if ln == [_THINK_HEADER]:
+                            continue  # the '✻ Thinking…' header is not reasoning
                         out.append("".join(t for _, t in ln))
             return "\n".join(out).strip()
         except Exception:
@@ -829,8 +1106,14 @@ class ChatUI:
         self._answer = None
         self._answer_event = asyncio.Event()
         self._invalidate()
-        await self._answer_event.wait()
-        self._answer_event = None
+        try:
+            await self._answer_event.wait()
+        finally:
+            # Clear the bar even if the wait was cancelled (Esc-stop while
+            # a confirmation is pending) — never leave a dangling question.
+            self._question = None
+            self._answer_event = None
+            self._invalidate()
         return self._answer in ("y", "yes")
 
     def _question_fragments(self):
@@ -841,7 +1124,7 @@ class ChatUI:
     def _activity_fragments(self):
         if not self._activity:
             return [("", "")]
-        return [("class:activity", f" ✸ {self._activity}")]
+        return [("class:activity", f" ✻ {self._activity}")]  # same glyph as the Thinking header — one agent, one icon
 
     # ── status ────────────────────────────────────────────────────────
 
@@ -852,21 +1135,29 @@ class ChatUI:
         frags: list[tuple[str, str]] = [
             ("class:status", f" ◆ MForege │ {self._status}")
         ]
+        if self._phase_started is not None:
+            elapsed = max(0, int(time.monotonic() - self._phase_started))
+            frags.append(("class:scroll",
+                          f" │ {_PHASE_PREFIX} {self._phase_label} {elapsed}s (Esc=stop)"))
         if self._scroll_offset > 0:
             frags.append(("class:scroll",
                           f" │ ↑ {self._scroll_offset} lines · End=bottom"))
         frags.append(("class:status",
-                      " │ Enter=send │ Shift/Alt+Enter=newline │ Ctrl+T=thinking │ Ctrl+C=quit "))
+                      " │ Enter=send │ Shift/Alt+Enter=newline │ Esc=stop │ Ctrl+T=thinking │ Ctrl+C=quit "))
         return frags
 
     # ── transcript rendering (colored, scrollable viewport) ─────────
 
     def _materialized_lines(self) -> list:
-        """Flatten segments to renderable lines (collapsed think → summary)."""
+        """Flatten segments to renderable lines (collapsed think → summary,
+        md segments → live-rendered markdown)."""
         lines: list = []
         for seg in self._segments:
             if seg.get("collapsed"):
                 lines.append([_THINK_SUMMARY])
+                continue
+            if seg["kind"] == "md":
+                lines.extend(seg["lines"] or _render_markdown(seg["text"]))
                 continue
             lines.extend(seg["lines"])
         # Anchored scrolling: while scrolled up, new lines must NOT slide
@@ -887,8 +1178,8 @@ class ChatUI:
             rows = self.app.output.get_size().rows
         except Exception:
             pass
-        # reserve = label(1) + separators(2) + status(1) + question(1)
-        #           + input (1..5, dynamic) + breathing room
+        # reserve = status(1) + question(1) + separator(1) + activity/menu
+        #           (0..1) + input (1..5, dynamic) + breathing room
         reserve = 5 + self._input_height() + 2
         return max(1, rows - reserve)
 
@@ -923,18 +1214,24 @@ class ChatUI:
         Handler runs inside the app's event loop, so ui.append() calls from
         it (and from tool callbacks) render live.
         """
-        async def worker():
-            while True:
-                text = await self._queue.get()
-                try:
-                    await handler(text)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    self.append(f"[!] Unexpected error: {e}", style="class:error")
-
-        worker_task = asyncio.get_event_loop().create_task(worker())
+        worker_task = asyncio.get_event_loop().create_task(self._worker(handler))
         try:
             await self.app.run_async()
         finally:
             worker_task.cancel()
+
+    async def _worker(self, handler) -> None:
+        """Dispatch loop: run each queued message as a child task so Esc can
+        cancel ONE message mid-flight without killing the worker loop."""
+        while True:
+            text = await self._queue.get()
+            handler_task = asyncio.get_event_loop().create_task(handler(text))
+            self._handler_task = handler_task
+            try:
+                await handler_task
+            except asyncio.CancelledError:
+                raise  # app shutdown — propagate
+            except Exception as e:
+                self.append(f"[!] Unexpected error: {e}", style="class:error")
+            finally:
+                self._handler_task = None

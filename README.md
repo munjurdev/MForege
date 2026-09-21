@@ -54,8 +54,15 @@ For Groq: grab a free key at https://console.groq.com (no credit card).
 - **Full tool loop** — when the model calls a tool, the result is sent back so
   the model can use it in its answer (streaming and non-streaming); up to 10
   rounds per message, configurable via `AgentConfig.max_tool_rounds`
-- **Streaming output** — responses appear token by token, with a
-  `thinking Ns...` timer while the model works
+- **Streaming output** — responses appear token by token, with a live
+  `⏳ thinking Ns (Esc=stop)` timer in the status bar while the model works
+- **Markdown rendering** — assistant replies render formatted, live:
+  `**bold**` becomes bold, `` `code` `` gets its own color, fenced code
+  blocks, headers, `•` bullets and `▌` quotes all appear styled while the
+  model streams — raw markdown syntax is never shown (agent-panel style)
+- **Esc to stop** — press Esc while the agent works and it stops cleanly:
+  the in-flight request unwinds, any partial answer is kept, and the turn
+  ends immediately (Esc with text in the input clears the line instead)
 - **Personality + response control** — friendly, witty, emoji-moderate; short
   answers for casual chat, clarifying questions for ambiguous or underspecified
   requests (never dumps giant tutorials or acts on invented details)
@@ -112,7 +119,8 @@ For Groq: grab a free key at https://console.groq.com (no credit card).
 - **Keys** — Enter sends, Shift+Enter adds a newline (Windows Terminal,
   cmd, Unix terminals). In VS Code's terminal use **Alt+Enter** for a
   newline — VS Code never transmits Shift+Enter to any program.
-  Ctrl+T expands the AI's thinking, Ctrl+C quits
+  Esc stops the agent (or clears the input), Ctrl+T expands the AI's
+  thinking, Ctrl+C quits
 - **Slash commands** — `/help`, `/plan`, `/tools`, `/new`, `/history`,
   `/sessions`, `/resume`, `/bash`, `/byok`, `/interview`, `/diagnostics`,
   `/review`, `/copy`, `/export`, `/theme:toggle`, `/reasoning`,

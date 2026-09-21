@@ -1,10 +1,11 @@
 """
 MForege — AI Agent CLI
 ======================
-IDE-style chat UI (prompt_toolkit):
-  - colored scrolling transcript on top
-  - input box pinned at the bottom
-  - status bar (model | workspace | plan progress)
+Agent-panel chat UI (prompt_toolkit):
+  - colored scrolling transcript on top (live markdown replies, thinking
+    blocks, tool activity, colored diffs)
+  - status/context line ABOVE the input (model | workspace | ctx | ⏳ timer)
+  - input box pinned at the very bottom — the last row on screen
 
 Run with: python main.py [--workspace PATH]
 
@@ -777,6 +778,11 @@ async def main(argv: list[str] | None = None) -> None:
     base_status = f"{args.model} │ {workspace}"
     ui = ChatUI(status_text=base_status)
 
+    # Esc-to-stop: the UI flips the agent's cooperative flag; the handler
+    # task is cancelled by the UI itself (the in-flight HTTP wait ends at
+    # its next await point, partial answers stay saved).
+    ui.set_stop_hook(lambda: agent.request_stop())
+
     # Live context meter (like an agent panel): ~tokens used / window %.
     def refresh_context_meter() -> None:
         try:
@@ -903,6 +909,11 @@ async def main(argv: list[str] | None = None) -> None:
                 # Streamed thinking tokens → live italic "Thinking" block,
                 # replaced in place until the first real answer token.
                 ui.stream_thinking(detail)
+            elif event == "stopped":
+                # Esc reached the agent — end the phase timer here; the
+                # transcript note is printed once by handle_message's
+                # finally (single source of truth, no double notes).
+                ui.set_phase(None)
         except Exception:
             pass  # display must never break the chat
 
@@ -928,6 +939,18 @@ async def main(argv: list[str] | None = None) -> None:
     notify_hook.callback = render_notify
 
     # ── Startup greeting (colored, in-UI) ─────────────────────────────
+    # Welcome box FIRST (like my banner first), then the notices — the
+    # agent's identity lands before any environment hints.
+    ui.append(boxed([
+        "MForege ✦ your personal AI agent",
+        f"backend: {args.backend} │ model: {args.model}",
+        f"workspace: {workspace}",
+        "",
+        "Nice to meet you! 👋",
+        "Type / for the command menu · Enter=send",
+        "Shift/Alt+Enter=newline · Esc=stop · Ctrl+T=thinking · Ctrl+C=quit",
+    ]), style="class:ok")
+    ui.append("")
     if not search_tool.is_configured:
         ui.append("[i] Optional: web search is off. Get a free Exa key at https://dashboard.exa.ai",
                   style="class:warn")
@@ -936,16 +959,6 @@ async def main(argv: list[str] | None = None) -> None:
     if os.environ.get("TERM_PROGRAM") == "vscode":
         ui.append("[i] VS Code: Shift+Enter needs a one-time keybinding — /vscode-hint", "class:dim")
         ui.append("    Use Alt+Enter meanwhile.", "class:dim")
-    ui.append(boxed([
-        "MForege ✦ your personal AI agent",
-        f"backend: {args.backend} │ model: {args.model}",
-        f"workspace: {workspace}",
-        "",
-        "Nice to meet you! 👋",
-        "Type / for the command menu · Enter=send",
-        "Shift/Alt+Enter=newline · Ctrl+T=thinking · Ctrl+C=quit",
-    ]), style="class:ok")
-    ui.append("")
 
     # ── Codebuff-parity slash commands ────────────────────────────
     async def handle_buffuff_command(user_input: str) -> None:
@@ -1098,13 +1111,9 @@ async def main(argv: list[str] | None = None) -> None:
     # ── Message handler (runs inside the UI event loop) ───────────────
     async def handle_message(user_input: str) -> None:
         nonlocal session
-        # Multi-line user messages: prefix each line so a long paste doesn't
-        # render as one giant green wall (screenshot feedback)
-        lines = user_input.split("\n")
-        ui.scroll_bottom()  # sending = want to see the fresh reply
-        ui.append(f"You: {lines[0]}", style="class:you")
-        for extra in lines[1:]:
-            ui.append(f"    {extra}", style="class:you")
+        # The user's message is echoed by the UI at SUBMIT time
+        # (echo_submission) — chat-app style, so a message sent while the
+        # agent is still working appears immediately and in order.
 
         low = user_input.lower().strip()
 
@@ -1195,9 +1204,14 @@ async def main(argv: list[str] | None = None) -> None:
                 ui.append(f"   - {tool.name}: {tool.description[:80]}", style="class:dim")
             return
 
-        # Chat (streaming). The pending-extraction happens inside chat();
-        # show "thinking" while we wait for the first token.
+        # Chat (streaming). The reply renders as LIVE MARKDOWN — bold,
+        # code blocks, headers and lists appear formatted while streaming
+        # (like a coding agent's panel; no raw ** or ``` ever visible).
+        # The phase timer starts here and KEEPS running through
+        # "responding" — one clock per turn; Esc stops while active.
+        ui._stop_requested = False
         ui.set_status("thinking…")
+        ui.set_phase("thinking")
         reply_text = ""
         try:
             response = await agent.chat(user_input, stream=True)
@@ -1207,19 +1221,27 @@ async def main(argv: list[str] | None = None) -> None:
                 async for chunk in response:
                     if first:
                         ui.set_status("responding…")
+                        ui.set_phase("responding")  # label swap, clock keeps running
                         ui.finish_thinking()   # collapse the Thinking block
-                        ui.append("MForege: ", end="", style="class:assistant")
+                        ui.begin_reply()       # open the live markdown block
                         first = False
                     reply_text += chunk
-                    ui.append(chunk, end="")
-                ui.append("")
+                    ui.stream_reply(chunk)
             else:
                 ui.finish_thinking()
-                ui.append("MForege: ", end="", style="class:assistant")
+                ui.begin_reply()
                 reply_text = response
-                ui.append(response)
+                ui.stream_reply(response)
         finally:
+            ui.end_reply()        # close the markdown block (final render stays)
             ui.finish_thinking()  # safety: never leave a dangling block
+            ui.set_phase(None)    # stop the live timer, disarm Esc
+            if ui._stop_requested:
+                # Esc was pressed this turn — confirm it in the transcript.
+                # (If the agent stopped mid-stream this is the only note;
+                # if it had already finished, it still confirms the key.)
+                ui._stop_requested = False
+                ui.append("[■] Stopped — tell me what to do next.", style="class:warn")
             refresh_context_meter()  # tokens grew — update the meter
             status = plan_state.progress_line()
             if status:

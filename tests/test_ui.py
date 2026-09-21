@@ -168,7 +168,7 @@ class TestThinkingBlock:
         ui.finish_thinking()
         text = _text(ui)
         assert "check the file" not in text    # hidden while collapsed…
-        assert "thought for a moment" in text  # …replaced by the marker
+        assert "Thinking… (Ctrl+T expands)" in text  # …replaced by the marker
 
     def test_collapsed_thinking_preserves_text_and_expands(self, ui):
         ui.stream_thinking("secret reasoning steps")
@@ -176,7 +176,7 @@ class TestThinkingBlock:
         assert "secret reasoning steps" not in _text(ui)
         ui.toggle_thinking()                    # Ctrl+T behavior
         assert "secret reasoning steps" in _text(ui)
-        assert "thought for a moment" not in _text(ui)
+        assert "Thinking… (Ctrl+T expands)" not in _text(ui)
         ui.toggle_thinking()                    # collapse again
         assert "secret reasoning steps" not in _text(ui)
 
@@ -195,7 +195,7 @@ class TestThinkingBlock:
         ui.finish_thinking()
         ui.stream_thinking("second")
         text = _text(ui)
-        assert "thought for a moment" in text   # old block stays collapsed
+        assert "Thinking… (Ctrl+T expands)" in text   # old block stays collapsed
         assert "second" in text                 # new block streams open
 
     def test_clear_resets_thinking_state(self, ui):
@@ -203,6 +203,14 @@ class TestThinkingBlock:
         ui.clear()
         ui.stream_thinking("fresh")  # starts a new block, no crash
         assert "fresh" in _text(ui)
+
+    def test_open_block_shows_header_and_text(self, ui):
+        """While streaming, the block shows a '✻ Thinking…' header above
+        the live reasoning text (agent-panel style)."""
+        ui.stream_thinking("reasoning away")
+        text = _text(ui)
+        assert "✻ Thinking…" in text
+        assert "reasoning away" in text
 
     def test_collapse_never_wipes_other_segments(self, ui):
         """Regression: collapsing Thinking used to wipe a TODOS block drawn
@@ -352,7 +360,217 @@ class TestShiftEnterWindowsPatch:
             c_long(1), (INPUT_RECORD * 1)(make_record("\r", 0)))) == ["\r"]
 
 
+class TestPhaseTimer:
+    """Live '⏳ thinking Ns' timer in the status bar (one clock per turn)."""
+
+    def test_phase_hidden_by_default(self, ui):
+        assert ui.phase_active is False
+        assert "⏳" not in "".join(t for _, t in ui._status_fragments())
+
+    def test_phase_shows_timer_and_esc_hint(self, ui):
+        ui.set_phase("thinking")
+        assert ui.phase_active is True
+        status = "".join(t for _, t in ui._status_fragments())
+        assert "⏳ thinking" in status
+        assert "Esc=stop" in status
+
+    def test_phase_label_swap_keeps_clock(self, ui):
+        """thinking → responding must NOT restart the timer (one clock/turn)."""
+        ui.set_phase("thinking")
+        started = ui._phase_started
+        ui.set_phase("responding")
+        assert ui._phase_started == started
+        assert ui._phase_label == "responding"
+
+    def test_phase_end_clears_timer(self, ui):
+        ui.set_phase("thinking")
+        ui.set_phase(None)
+        assert ui.phase_active is False
+        assert "⏳" not in "".join(t for _, t in ui._status_fragments())
+
+
+class TestEscStop:
+    """Esc while the agent works → cooperative stop (hook + task cancel)."""
+
+    def test_request_stop_calls_hook_and_records(self, ui):
+        hits = []
+        ui.set_stop_hook(lambda: hits.append(1))
+        ui.request_stop()
+        assert hits == [1]
+        assert ui._stop_requested is True
+
+    def test_request_stop_clears_activity_pin(self, ui):
+        ui.set_activity("edit_file(path=x.py)")
+        ui.request_stop()
+        assert ui._activity_fragments() == [("", "")]
+
+    def test_request_stop_without_task_sets_status(self, ui):
+        ui.request_stop()  # no hook, no running handler (bare UI)
+        assert ui._stop_requested is True
+        assert ui._status == "stopped"
+
+    def test_request_stop_hook_failure_never_raises(self, ui):
+        def bad_hook():
+            raise RuntimeError("wiring bug")
+
+        ui.set_stop_hook(bad_hook)
+        ui.request_stop()  # must not raise
+        assert "Stop failed" in _text(ui)
+
+    @pytest.mark.asyncio
+    async def test_request_stop_cancels_running_handler(self, ui):
+        started = asyncio.Event()
+
+        async def slow():
+            started.set()
+            await asyncio.sleep(30)
+
+        task = asyncio.get_event_loop().create_task(slow())
+        ui._handler_task = task
+        await started.wait()
+        ui.request_stop()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_confirm_clears_question_when_cancelled(self, ui):
+        """Esc-stop during a pending confirmation must not leave a
+        dangling question bar."""
+        confirm_task = asyncio.get_event_loop().create_task(ui.confirm("CREATE x"))
+        await asyncio.sleep(0.01)
+        assert ui._question == "CREATE x"
+        confirm_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await confirm_task
+        assert ui._question is None
+        assert ui._question_fragments() == [("", "")]
+
+
+class TestEchoSubmission:
+    """User messages echo at SUBMIT time, not when the handler starts."""
+
+    def test_echoes_message(self, ui):
+        ui.echo_submission("do the thing")
+        assert "You: do the thing" in _text(ui)
+
+    def test_multiline_is_indented(self, ui):
+        ui.echo_submission("line one\nline two")
+        text = _text(ui)
+        assert "You: line one" in text
+        assert "    line two" in text
+
+    def test_echo_never_raises_on_corrupted_state(self, ui):
+        ui._segments = None  # corrupt internals on purpose
+        ui.echo_submission("boom")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_worker_runs_handler_but_echo_is_already_visible(self, ui):
+        """Full loop: the handler starts AFTER the echo — a message typed
+        while the agent works appears in order, immediately."""
+        observed = {}
+
+        async def handler(text):
+            observed["at_handler"] = _text(ui)   # recorded at handler start
+
+        worker_task = asyncio.get_event_loop().create_task(ui._worker(handler))
+        try:
+            await asyncio.sleep(0.05)      # worker reaches queue.get()
+            ui.echo_submission("hello")    # what Enter does at submit…
+            ui._queue.put_nowait("hello")  # …then the message is queued
+            # Wait for the handler to start (robust to scheduling lag)
+            for _ in range(20):
+                if "at_handler" in observed:
+                    break
+                await asyncio.sleep(0.05)
+            assert "You: hello" in observed["at_handler"]
+            assert ui._handler_task is None  # cleaned up after completion
+        finally:
+            worker_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_worker_survives_handler_exception(self, ui):
+        """A crashing message must not kill the dispatch loop."""
+        processed = []
+
+        async def handler(text):
+            if text == "boom":
+                raise RuntimeError("kaboom")
+            processed.append(text)
+
+        worker_task = asyncio.get_event_loop().create_task(ui._worker(handler))
+        try:
+            await asyncio.sleep(0.05)
+            ui._queue.put_nowait("boom")
+            await asyncio.sleep(0.1)
+            assert "[!] Unexpected error: kaboom" in _text(ui)
+            ui._queue.put_nowait("next")
+            await asyncio.sleep(0.1)
+            assert processed == ["next"]  # loop still alive
+        finally:
+            worker_task.cancel()
+
+
+class TestMarkdownRendering:
+    """Assistant replies render as formatted markdown (agent-style output)."""
+
+    def _render(self, text):
+        from app.ui import _render_markdown
+        return ["".join(t for _, t in ln) for ln in _render_markdown(text)]
+
+    def _frags(self, text):
+        via_stream = None
+        ui2 = ChatUI(status_text="t", output=DummyOutput())
+        ui2.begin_reply()
+        ui2.stream_reply(text)
+        via_stream = ["".join(t for _, t in ln) for ln in ui2._materialized_lines()]
+        return via_stream
+
+    def test_bold_renders_without_asterisks(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("this is **important** stuff")
+        text = _text(ui)
+        assert "important" in text and "**" not in text  
+
+    def test_inline_code_colored(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("run `pip install x` now")
+        lines = ui._materialized_lines()
+        styles = [s for ln in lines for s, _ in ln if s]
+        assert any("md-code" in s for s in styles)
+        assert "`" not in _text(ui)
+    
+    def test_code_block_lines_styled(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("before\n```python\nx = 1\n```\nafter")
+        lines = ui._materialized_lines()
+        code_ln = next(ln for ln in lines if "x = 1" in "".join(t for _, t in ln))
+        assert any("md-code-block" in s for s, _ in code_ln)
+        assert "after" in "".join(t for _, t in lines[-1])
+    
+    def test_headers_bullets_quotes(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("# Title\n- item one\n> note\n2. second")
+        text = _text(ui)
+        assert "Title" in text
+        assert "• item one" in text           # - → •
+        assert "▌ note" in text               # > → ▌
+        assert "2. second" in text
+
+    def test_streaming_accumulates_and_renders(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("**par")
+        ui.stream_reply("tial**")  # completes **partial**
+        text = _text(ui)
+        assert "partial" in text and "**" not in text
+
+    def test_plain_text_untouched(self, ui):
+        ui.begin_reply()
+        ui.stream_reply("just words here")
+        assert "just words here" in _text(ui)
+
+
 class TestStatusAndQuestion:
+
     def test_status_fragment(self, ui):
         ui.set_status("thinking…")
         assert "thinking…" in ui._status_fragments()[0][1]
