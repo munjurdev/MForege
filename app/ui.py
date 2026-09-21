@@ -1148,8 +1148,9 @@ class ChatUI:
         if self._scroll_offset > 0:
             frags.append(("class:scroll",
                           f" │ ↑ {self._scroll_offset} lines · End=bottom"))
-        frags.append(("class:status",
-                      " │ Enter=send │ Shift/Alt+Enter=newline │ Esc=stop │ Ctrl+T=thinking │ Ctrl+C=quit "))
+        # NO permanent shortcut list here (matches the Codebuff panel —
+        # status shows context only). Shortcuts live in the welcome box
+        # and /help.
         return frags
 
     # ── transcript rendering (colored, scrollable viewport) ─────────

@@ -404,17 +404,9 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
     session_store = SessionStore()
     session = session_store.start()
 
-    # Auto-continue: pick up the most recent chat automatically (like an
-    # agent session that survives cutoffs). Quietly skips if none exist.
-    latest = session_store.latest_id()
-    if latest:
-        stored = session_store.load(latest)
-        if stored and stored.messages:
-            agent.restore_session_messages(stored.messages)
-            session.id = stored.id
-            session.title = stored.title
-            session.messages = list(stored.messages)
-            _pc(f"[↩] Continuing your last chat ({len(stored.messages)} messages) — /clear to start fresh.", COLORS_DIM)
+    # NO auto-continue: every launch starts fresh (like the Codebuff
+    # panel). Old chats stay on disk — /sessions lists them, /resume
+    # <id> restores one explicitly.
 
     async def handle_sessions_command(slash, agent, session, pc) -> None:
         """"/sessions" list · "/resume [id]" restore an old conversation."""
@@ -799,18 +791,9 @@ async def main(argv: list[str] | None = None) -> None:
     session_store = SessionStore()
     session = session_store.start()
 
-    # Auto-continue: pick up the most recent chat automatically (like an
-    # agent session that survives cutoffs). Shows a transcript note.
-    _latest = session_store.latest_id()
-    if _latest:
-        _stored = session_store.load(_latest)
-        if _stored and _stored.messages:
-            agent.restore_session_messages(_stored.messages)
-            session.id = _stored.id
-            session.title = _stored.title
-            session.messages = list(_stored.messages)
-            ui.append(f"[↩] Continuing your last chat — '{_stored.title}' ({len(_stored.messages)} messages). /clear to start fresh, /sessions for more.",
-                      style="class:dim")
+    # NO auto-continue: every launch starts fresh (like the Codebuff
+    # panel). Old chats stay on disk — /sessions lists them, /resume
+    # <id> restores one explicitly.
 
     # Live TODOS block: PlanState notifies → transcript block redraws in
     # place (Codebuff-style checkmarks). Falls back silently if anything

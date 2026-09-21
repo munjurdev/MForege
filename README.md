@@ -133,10 +133,9 @@ For Groq: grab a free key at https://console.groq.com (no credit card).
   fold into a compact summary injected before the recent ones, so long
   missions never lose their start
 - **Context meter** — live `ctx ~12.3K (2%)` in the status bar
-- **Session resume** — every conversation auto-saves; on the next launch
-  MForege automatically continues your last chat (like an agent session
-  that survives a cutoff). `/sessions` lists past chats, `/resume [id]`
-  restores a specific one
+- **Session resume** — every conversation auto-saves to disk. Launches
+  start FRESH (no auto-continue); `/sessions` lists past chats and
+  `/resume [id]` restores one explicitly
 
 ### Resilience
 
