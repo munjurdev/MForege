@@ -16,7 +16,7 @@ The input box is the BOTTOM-MOST element — everything else sits above it
     │  /help  /plan …                     │ slash menu (0–6 rows)
     │  ⚠ EDIT main.py? (y/n)              │ confirm (0–1 row)
     │  ◆ model │ ctx │ ⏳ 3s (Esc=stop)   │ status (1 row)
-    ├─ ✻ message ────────────────────────┤
+    ├─────────────────────────────────────┤
     │  > input box   ← bottom-most row    │
     └─────────────────────────────────────┘
 
@@ -437,6 +437,13 @@ class ChatUI:
         # Live phase timer ("⏳ thinking 3s" in the status bar)
         self._phase_label: str | None = None
         self._phase_started: float | None = None
+        # Hover state of the '✕ End session' button (reverse-video while
+        # the pointer is over it; MOUSE_MOVE sets it, MOUSE_UP clears it).
+        self._end_session_hover = False
+        # Session bar (reference-panel style): start time + optional fixed
+        # label override (tests); formatted like '· 1h 2m' next to the model.
+        self._session_started: float | None = None
+        self._session_label: str | None = None
 
         # Transcript pane (colored fragments, scrollable via PgUp/PgDn
         # and the mouse wheel)
@@ -448,10 +455,11 @@ class ChatUI:
             right_margins=[TranscriptScrollBar(self)],
         )
 
-        # Input box — grows with content (1–5 rows), drawn inside a bordered
-        # frame with the label embedded in the top border (IDE-style).
+        # Input box — grows with content (2–5 rows), drawn inside a bordered
+        # frame (IDE-style). NO title in the border — the reference panel's
+        # composer has a plain border; identity lives in the session bar above.
         self.input = TextArea(height=self._input_height, multiline=True, wrap_lines=True)
-        self.input_frame = Frame(self.input, title=" ✻ message ", style="class:inputbox")
+        self.input_frame = Frame(self.input, style="class:inputbox")
 
         # Slash-command popup (visible while typing a "/" prefix)
         self._menu_items: list[tuple[str, str]] = []
@@ -476,10 +484,17 @@ class ChatUI:
             height=lambda: 1 if self._activity else 0,
         )
 
-        # Status bar
+        # Status ROW (reference-panel layout): ONE full-width window whose
+        # fragments compute the middle padding themselves — '◆ model …' on
+        # the left, '✕ End session' pinned to the right edge, and the whole
+        # row reading as one continuous green (class:status) highlight.
+        # (A VSplit of three windows does NOT pin right: leftover width is
+        # distributed round-robin to every growable window.)
         self.status_win = Window(
             content=FormattedTextControl(self._status_fragments),
             height=1,
+            char=" ",
+            style="class:status",
         )
 
         kb = KeyBindings()
@@ -505,6 +520,13 @@ class ChatUI:
             text = text.strip()
             if text:
                 self.echo_submission(text)
+                # While the agent is mid-turn (or a message is already
+                # waiting), the message QUEUES — tell the user visibly,
+                # like the reference panel's "✓ Queued" note, so a silent
+                # submit never looks lost.
+                if self._handler_task is not None and not self._handler_task.done():
+                    self.append("  ✓ Queued — will run after the current turn.",
+                                style="class:dim")
                 self._queue.put_nowait(text)
 
         # Arrow keys navigate the popup when it is visible; otherwise they
@@ -662,6 +684,8 @@ class ChatUI:
                 "menu-cmd": "#5fd7ff bold",
                 "menu-desc": "#6c6c6c",
                 "menu-selected": "reverse",
+                "session-end": "#ff5f5f bold",
+                "session-hover": "reverse",
             }),
             # Mouse support: wheel scrolls the transcript (TranscriptControl
             # + ScrollUp/Down bindings). Click-to-position stays handled by
@@ -678,7 +702,11 @@ class ChatUI:
 
     # ── input sizing ─────────────────────────────────────────────────
 
-    MIN_INPUT_ROWS = 1
+    # Freebuff-panel sizing: the composer is a roomy 2 content rows tall
+    # when empty (border + 2 rows + border = 4 total), then grows with typed
+    # lines up to MAX_INPUT_ROWS. MIN=1 made the box feel cramped next to
+    # the reference panel.
+    MIN_INPUT_ROWS = 2
     MAX_INPUT_ROWS = 5
     # ── slash-command menu (Freebuff-style popup) ────────────────────
 
@@ -742,7 +770,8 @@ class ChatUI:
         return frags
 
     def _input_height(self) -> int:
-        """Dynamic height: 1 row + extra lines typed, capped at MAX_INPUT_ROWS."""
+        """Dynamic height: MIN_INPUT_ROWS base (2, Freebuff-style) + extra
+        lines typed, capped at MAX_INPUT_ROWS."""
         try:
             lines = self.input.text.count("\n") + 1
         except Exception:
@@ -838,6 +867,20 @@ class ChatUI:
 
     def set_status(self, text: str) -> None:
         self._status = text
+        self._invalidate()
+
+    def set_session_start(self, started: float | None = None) -> None:
+        """Start the session clock shown next to the model in the session bar.
+
+        Call with the default (None) to anchor at 'now'. Passing a fixed
+        label (set_session_label) overrides the computed clock entirely.
+        """
+        self._session_started = time.monotonic() if started is None else started
+        self._invalidate()
+
+    def set_session_label(self, label: str | None) -> None:
+        """Force a fixed session-bar label (e.g. '1h left') — test hook."""
+        self._session_label = label
         self._invalidate()
 
     # ── agent phase timer (live "⏳ thinking Ns") ─────────────────────
@@ -1135,23 +1178,73 @@ class ChatUI:
     # ── status ────────────────────────────────────────────────────────
 
     def _status_fragments(self):
-        # Scroll position indicator: while the viewport is away from the
-        # live tail, show how far up the user is (anchored-scroll aware —
-        # the number grows as new lines arrive, so it never lies).
-        frags: list[tuple[str, str]] = [
-            ("class:status", f" ◆ MForege │ {self._status}")
-        ]
+        # Reference-panel session ROW: '◆ <model> · <clock> │ ctx…' on the
+        # left, stretchy class:status padding in the middle, and the
+        # clickable '✕ End session' pinned to the RIGHT EDGE — the whole
+        # row reads as one continuous green highlight (the window's own
+        # char=' '/class:status background fills any residual width).
+        # The pad width is computed from the live terminal width; on any
+        # failure it degrades to 1 space (never breaks the chat).
+        left = self._session_bar()
         if self._phase_started is not None:
             elapsed = max(0, int(time.monotonic() - self._phase_started))
-            frags.append(("class:scroll",
-                          f" │ {_PHASE_PREFIX} {self._phase_label} {elapsed}s (Esc=stop)"))
+            left += f" │ {_PHASE_PREFIX} {self._phase_label} {elapsed}s (Esc=stop)"
         if self._scroll_offset > 0:
-            frags.append(("class:scroll",
-                          f" │ ↑ {self._scroll_offset} lines · End=bottom"))
-        # NO permanent shortcut list here (matches the Codebuff panel —
-        # status shows context only). Shortcuts live in the welcome box
-        # and /help.
+            left += f" │ ↑ {self._scroll_offset} lines · End=bottom"
+
+        end_txt = "✕ End session "
+        try:
+            cols = self.app.output.get_size().columns
+        except Exception:
+            cols = 80
+        pad = max(1, cols - _display_width(left) - _display_width(end_txt))
+
+        frags: list[tuple[str, str]] = [("class:status", left),
+                                        ("class:status", " " * pad)]
+        frags.append(self._end_session_fragments()[-1])
         return frags
+
+    def _end_session_fragments(self):
+        """The clickable, hover-reactive '✕ End session' fragment.
+
+        CLICKABLE (MOUSE_DOWN quits, same as /exit / Ctrl+C) and
+        HOVER-REACTIVE (MOUSE_MOVE flips the reverse-video highlight;
+        MOUSE_UP clears it). MOUSE_MOVE arrives on both event paths
+        (VT100 ?1003h any-motion tracking and Windows MOUSE_MOVED
+        records), so this works in VS Code, Windows Terminal and plain
+        cmd.
+        """
+        def _end_session(mouse_event) -> None:
+            try:
+                if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
+                    self.exit()
+                elif mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+                    if not self._end_session_hover:
+                        self._end_session_hover = True
+                        self._invalidate()
+                elif self._end_session_hover:  # MOUSE_UP (and any other event)
+                    self._end_session_hover = False
+                    self._invalidate()
+            except Exception:
+                pass  # display must never break the chat
+
+        style = "class:session-end class:session-hover" if self._end_session_hover \
+            else "class:session-end"
+        return [(style, "✕ End session ", _end_session)]
+
+    def _session_bar(self) -> str:
+        """Reference-panel session row: 'GLM 5.3 Flash · 1h left'.
+
+        The model comes from the status text; the session clock counts up
+        from UI start (set_session_start), or the fixed '1h left' style can
+        be forced via _session_label for tests.
+        """
+        model = self._status.split("│")[0].strip() or "MForege"
+        clock = self._session_label
+        if clock is None and self._session_started is not None:
+            mins = int((time.monotonic() - self._session_started) / 60)
+            clock = f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
+        return f" ◆ {model}" + (f" · {clock}" if clock else "")
 
     # ── transcript rendering (colored, scrollable viewport) ─────────
 
@@ -1186,7 +1279,7 @@ class ChatUI:
         except Exception:
             pass
         # reserve = status(1) + question(1) + separator(1) + activity/menu
-        #           (0..1) + input (1..5, dynamic) + breathing room
+        #           (0..1) + input (2..5, dynamic) + breathing room
         reserve = 5 + self._input_height() + 2
         return max(1, rows - reserve)
 
@@ -1194,6 +1287,12 @@ class ChatUI:
         frags: list[tuple[str, str]] = []
         try:
             lines = self._materialized_lines()
+            if self._scroll_offset == 0:
+                # Follow the live tail — but ignore trailing blank
+                # separator lines appended after each message, so a tiny
+                # viewport still shows the newest real content.
+                while lines and not lines[-1]:
+                    lines.pop()
             visible = self._visible_row_count()
 
             if self._scroll_offset == 0:

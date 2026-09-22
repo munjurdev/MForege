@@ -32,13 +32,13 @@ def _text(ui) -> str:
 
 
 class TestDynamicInputHeight:
-    def test_empty_is_one_row(self, ui):
+    def test_empty_is_min_rows(self, ui):
         ui.input.text = ""
-        assert ui._input_height() == 1
+        assert ui._input_height() == ChatUI.MIN_INPUT_ROWS
 
-    def test_single_line_is_one_row(self, ui):
+    def test_single_line_is_min_rows(self, ui):
         ui.input.text = "hello"
-        assert ui._input_height() == 1
+        assert ui._input_height() == ChatUI.MIN_INPUT_ROWS
 
     def test_grows_with_lines(self, ui):
         ui.input.text = "line1\nline2"
@@ -94,7 +94,7 @@ class TestScrolling:
         ui_small.scroll_up(30)
         text = "".join(t for _, t in ui_small._fragments())
         assert "line 49" not in text   # live tail is out of view
-        assert "line 19" in text       # history window moved up instead
+        assert "line 20" in text       # history window moved up instead
 
     def test_scroll_bottom_snaps_back_to_tail(self, ui_small):
         for i in range(50):
@@ -133,10 +133,12 @@ class TestScrolling:
 
     def test_status_bar_shows_scroll_hint_only_when_scrolled(self, ui):
         # scroll indicator: '↑ N lines · End=bottom' while scrolled up
-        assert "lines · End" not in ui._status_fragments()[0][1]
+        left = ui._status_fragments()[0][1]
+        assert "lines · End" not in left
         ui.append("x")
         ui.scroll_up(3)
-        assert "↑ 3 lines · End=bottom" in ui._status_fragments()[1][1]
+        left = ui._status_fragments()[0][1]
+        assert "↑ 3 lines · End=bottom" in left
         ui.scroll_bottom()
         assert "lines · End" not in ui._status_fragments()[0][1]
 
@@ -365,12 +367,12 @@ class TestPhaseTimer:
 
     def test_phase_hidden_by_default(self, ui):
         assert ui.phase_active is False
-        assert "⏳" not in "".join(t for _, t in ui._status_fragments())
+        assert "⏳" not in "".join(t for _, t, *_ in ui._status_fragments())
 
     def test_phase_shows_timer_and_esc_hint(self, ui):
         ui.set_phase("thinking")
         assert ui.phase_active is True
-        status = "".join(t for _, t in ui._status_fragments())
+        status = "".join(t for _, t, *_ in ui._status_fragments())
         assert "⏳ thinking" in status
         assert "Esc=stop" in status
 
@@ -386,7 +388,7 @@ class TestPhaseTimer:
         ui.set_phase("thinking")
         ui.set_phase(None)
         assert ui.phase_active is False
-        assert "⏳" not in "".join(t for _, t in ui._status_fragments())
+        assert "⏳" not in "".join(t for _, t, *_ in ui._status_fragments())
 
 
 class TestEscStop:
@@ -574,6 +576,77 @@ class TestStatusAndQuestion:
     def test_status_fragment(self, ui):
         ui.set_status("thinking…")
         assert "thinking…" in ui._status_fragments()[0][1]
+
+    def test_session_bar_format(self, ui):
+        """Session row: '◆ <model> · <clock>' (reference-panel style)."""
+        ui.set_status("GLM 5.3 Flash │ ctx 5%")
+        ui.set_session_label("1h left")
+        bar = ui._status_fragments()[0][1]
+        assert "GLM 5.3 Flash" in bar and "1h left" in bar
+        assert "◆" in bar
+
+    def test_session_row_pins_end_session_right(self, ui):
+        """Session ROW: middle pad carries class:status (one continuous
+        green highlight) and '✕ End session' lands at the right edge
+        (left text + pad + button == terminal width)."""
+        frags = ui._status_fragments()
+        assert frags[0][0] == "class:status"          # left: ◆ model …
+        assert frags[1][0] == "class:status"          # pad: same green
+        assert frags[1][1].strip() == ""              # pad is spaces only
+        end = frags[-1]
+        assert "End session" in end[1]
+        try:
+            cols = ui.app.output.get_size().columns
+        except Exception:
+            cols = 80
+        total = (len(frags[0][1]) + len(frags[1][1])
+                 + sum(len(t) for _, t, *_ in [end]))
+        assert total == cols                          # pinned to the edge
+
+    def test_end_session_clickable(self, ui):
+        """'✕ End session' (its own right-aligned window) carries a mouse
+        handler that exits on click."""
+        end = ui._end_session_fragments()[-1]
+        assert "End session" in end[1]
+        assert callable(end[2])
+        from prompt_toolkit.mouse_events import (
+            MouseEvent, MouseButton, MouseEventType,
+        )
+        from prompt_toolkit.data_structures import Point
+        hits = []
+        ui.exit = lambda: hits.append(1)
+        click = MouseEvent(position=Point(0, 0),
+                           event_type=MouseEventType.MOUSE_DOWN,
+                           button=MouseButton.LEFT, modifiers=frozenset())
+        end[2](click)
+        assert hits == [1]              # click → app exits
+        move = MouseEvent(position=Point(0, 0),
+                          event_type=MouseEventType.MOUSE_MOVE,
+                          button=MouseButton.NONE, modifiers=frozenset())
+        end[2](move)
+        assert hits == [1]              # other events ignored
+
+    def test_end_session_hover_highlight(self, ui):
+        """Mouse move over the button flips a reverse-video hover style;
+        MOUSE_UP clears it again (button reads as interactive)."""
+        from prompt_toolkit.mouse_events import (
+            MouseEvent, MouseButton, MouseEventType,
+        )
+        from prompt_toolkit.data_structures import Point
+
+        def ev(t):
+            return MouseEvent(position=Point(0, 0), event_type=t,
+                              button=MouseButton.NONE, modifiers=frozenset())
+
+        end = ui._end_session_fragments()[-1]
+        assert end[0] == "class:session-end"          # idle: plain red
+        end[2](ev(MouseEventType.MOUSE_MOVE))
+        assert ui._end_session_hover is True
+        assert ui._end_session_fragments()[-1][0] == \
+            "class:session-end class:session-hover"   # highlighted
+        ui._end_session_fragments()[-1][2](ev(MouseEventType.MOUSE_UP))
+        assert ui._end_session_hover is False
+        assert ui._end_session_fragments()[-1][0] == "class:session-end"
 
     def test_question_hidden_by_default(self, ui):
         assert ui._question_fragments() == [("", "")]
@@ -763,23 +836,23 @@ class TestScrollIndicator:
     """Status bar shows '↑ N lines · End=bottom' while scrolled up."""
 
     def test_hidden_at_bottom(self, ui):
-        assert "lines · End" not in "".join(t for _, t in ui._status_fragments())
+        assert "lines · End" not in "".join(t for _, t, *_ in ui._status_fragments())
 
     def test_shows_offset_while_scrolled(self, ui):
         ui.scroll_up(12)
-        status = "".join(t for _, t in ui._status_fragments())
+        status = "".join(t for _, t, *_ in ui._status_fragments())
         assert "↑ 12 lines · End=bottom" in status
 
     def test_updates_with_offset(self, ui):
         ui.scroll_up(1)
-        assert "↑ 1 lines" in "".join(t for _, t in ui._status_fragments())
+        assert "↑ 1 lines" in "".join(t for _, t, *_ in ui._status_fragments())
         ui.scroll_up(4)
-        assert "↑ 5 lines" in "".join(t for _, t in ui._status_fragments())
+        assert "↑ 5 lines" in "".join(t for _, t, *_ in ui._status_fragments())
 
     def test_hidden_again_after_bottom(self, ui):
         ui.scroll_up(7)
         ui.scroll_bottom()
-        assert "lines · End" not in "".join(t for _, t in ui._status_fragments())
+        assert "lines · End" not in "".join(t for _, t, *_ in ui._status_fragments())
 
 
 class TestScrollBarMargin:

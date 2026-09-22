@@ -774,6 +774,7 @@ async def main(argv: list[str] | None = None) -> None:
     # task is cancelled by the UI itself (the in-flight HTTP wait ends at
     # its next await point, partial answers stay saved).
     ui.set_stop_hook(lambda: agent.request_stop())
+    ui.set_session_start()  # session-bar clock: '◆ model · 12m' next to the model
 
     # Live context meter (like an agent panel): ~tokens used / window %.
     def refresh_context_meter() -> None:

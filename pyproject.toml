@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mforege"
-version = "0.1.14"
+version = "0.1.15"
 description = "MForege — a personal AI agent CLI with tools, memory, and an IDE-style terminal UI"
 readme = "README.md"
 license = { text = "MIT" }
