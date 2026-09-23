@@ -197,12 +197,34 @@ class _ReachedUI(Exception):
 
 
 class TestMainIntegration:
-    def _prep(self, monkeypatch):
+    def _prep(self, monkeypatch, tmp_path):
         """Common stubs: PyPI says 99.0.0; ChatUI raises _ReachedUI; wizard
-        raises _ReachedUI too (so both code paths funnel into one signal)."""
+        raises _ReachedUI too (so both code paths funnel into one signal).
+
+        Hermetic config: CI runners have no ~/.mforege/.env and no ./.env,
+        so main() would fire the setup wizard or exit(1) on a missing key
+        before ever reaching the update step. A fake global config makes
+        the environment identical to a configured machine — and chdir away
+        from the repo so a developer's local .env can't leak in either.
+        """
         monkeypatch.setattr("urllib.request.urlopen", _fake_pypi("99.0.0"))
         monkeypatch.setattr(main, "ChatUI", _StubUI)
         monkeypatch.setattr(main, "run_setup_wizard", _ReachedUI)
+        home = tmp_path / "home"
+        cfg_dir = home / ".mforege"
+        cfg_dir.mkdir(parents=True)
+        cfg_file = cfg_dir / ".env"
+        cfg_file.write_text(
+            "LLM_BACKEND=custom\nAPI_KEY=test-key\nBASE_URL=http://localhost:1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)                       # no ./.env
+        monkeypatch.setattr(main, "_HOME_CONFIG_PATH", str(cfg_file))
+        monkeypatch.setattr(main, "_root_config", None)   # no repo .env
+        monkeypatch.setattr(main, "_MFOREGE_ROOT", str(tmp_path))
+        monkeypatch.setattr(
+            main, "_home_config", main.Config(main.RepositoryEnv(str(cfg_file)))
+        )
 
     def _run_main(self, argv):
         try:
@@ -215,22 +237,22 @@ class TestMainIntegration:
             raise
         return "no-update-path"
 
-    def test_main_triggers_update_by_default(self, isolated, monkeypatch):
-        self._prep(monkeypatch)
+    def test_main_triggers_update_by_default(self, isolated, monkeypatch, tmp_path):
+        self._prep(monkeypatch, tmp_path)
         assert self._run_main([]) == "updated"
 
-    def test_main_skips_update_with_flag(self, isolated, monkeypatch):
-        self._prep(monkeypatch)
+    def test_main_skips_update_with_flag(self, isolated, monkeypatch, tmp_path):
+        self._prep(monkeypatch, tmp_path)
         assert self._run_main(["--no-update"]) == "no-update-path"
 
-    def test_main_skips_update_with_env(self, isolated, monkeypatch):
-        self._prep(monkeypatch)
+    def test_main_skips_update_with_env(self, isolated, monkeypatch, tmp_path):
+        self._prep(monkeypatch, tmp_path)
         monkeypatch.setenv(su.ENV_NO_UPDATE, "1")
         assert self._run_main([]) == "no-update-path"
 
-    def test_main_help_wins_over_update(self, isolated, monkeypatch, capsys):
+    def test_main_help_wins_over_update(self, isolated, monkeypatch, capsys, tmp_path):
         # --help must print help and exit 0 without any update side effects
-        self._prep(monkeypatch)
+        self._prep(monkeypatch, tmp_path)
         with pytest.raises(SystemExit) as ei:
             main.asyncio.run(main.main(["--help"]))
         assert ei.value.code == 0
