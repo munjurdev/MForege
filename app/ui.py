@@ -433,6 +433,10 @@ class ChatUI:
         self._stop_requested = False
         self._on_stop = None           # Callable[[], None] | None
         self._handler_task: asyncio.Task | None = None
+        # Set True by run_async's finally BEFORE the worker is cancelled, so
+        # _worker can tell shutdown-cancel from Esc-stop-cancel without
+        # Task.cancelling() (a Python 3.11+ API — must work on 3.10 too).
+        self._worker_stopping = False
         # Live markdown reply segment (None = no reply streaming right now)
         self._md_seg: dict | None = None
         # Live phase timer ("⏳ thinking 3s" in the status bar)
@@ -1328,6 +1332,10 @@ class ChatUI:
         try:
             await self.app.run_async()
         finally:
+            # Flag FIRST, then cancel: inside _worker a CancelledError seen
+            # while this flag is set means the app is shutting down; any
+            # other CancelledError is a child handler being Esc-stopped.
+            self._worker_stopping = True
             worker_task.cancel()
 
     async def _worker(self, handler) -> None:
@@ -1339,7 +1347,6 @@ class ChatUI:
         the Esc-stop path — must be swallowed here, or the worker task
         dies and the app freezes: no message is processed until restart.
         """
-        me = asyncio.current_task()
         while True:
             text = await self._queue.get()
             handler_task = asyncio.get_event_loop().create_task(handler(text))
@@ -1347,7 +1354,7 @@ class ChatUI:
             try:
                 await handler_task
             except asyncio.CancelledError:
-                if me is not None and me.cancelling():
+                if self._worker_stopping:
                     raise  # the WORKER was cancelled — real shutdown, propagate
                 # Only the child was cancelled (Esc-stop): the turn ended,
                 # the partial answer was already persisted by the agent's
