@@ -25,6 +25,9 @@ from app.agent.tools import Tool
 
 # Cap page content per result so a few searches don't blow the context window
 MAX_CONTENT_CHARS = 1500
+# A hung search must not wedge the agent's turn forever (Esc also works,
+# but a self-recovering timeout is the friendlier failure).
+SEARCH_TIMEOUT = 30.0
 
 
 class ExaSearchTool(Tool):
@@ -85,12 +88,17 @@ class ExaSearchTool(Tool):
 
         try:
             # exa_py is synchronous — run in a thread so the event loop stays free
-            response = await asyncio.to_thread(
-                client.search_and_contents,
-                query,
-                num_results=self._num_results,
-                text=True,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.search_and_contents,
+                    query,
+                    num_results=self._num_results,
+                    text=True,
+                ),
+                timeout=SEARCH_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            return f"Error: web search timed out after {SEARCH_TIMEOUT:.0f}s — try again later"
         except Exception as e:
             return f"Error: web search failed: {e}"
 

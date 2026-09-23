@@ -228,8 +228,13 @@ class Agent:
         if stream_mode:
             return self._stream_response(user_message=message)
 
-        reply = await self._get_response()
-        return reply
+        try:
+            return await self._get_response()
+        finally:
+            # One-shot stop: whatever fired (or was abandoned mid-turn by a
+            # cancelled task) must not leak into the NEXT turn.
+            self._stop_requested = False
+            self._stop_reason_msg = ""
 
     async def flush_memory(self) -> None:
         """Kept for API compatibility (no extraction happens anymore)."""
@@ -552,9 +557,18 @@ class Agent:
                 messages.extend(tool_results)
                 # Tool progress is surfaced below the stream, not in the text
         finally:
-            # Persist whatever was produced, even if the consumer stops early
-            if full_content and not saved:
-                self.memory.add(Message(role="assistant", content=full_content))
+            # Esc-before-start edge case: chat() ran, but the generator's
+            # first iteration never happened (consumer aborted early) —
+            # _clear_stop() never ran, so clear a stale flag here too.
+            self._stop_requested = False
+            self._stop_reason_msg = ""
+            try:
+                # Persist whatever was produced, even if the consumer stops
+                # early — but never mask the original error with a save bug.
+                if full_content and not saved:
+                    self.memory.add(Message(role="assistant", content=full_content))
+            except Exception:
+                pass
 
     # ── Tool execution ─────────────────────────────────
 

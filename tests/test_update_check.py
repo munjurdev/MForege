@@ -38,6 +38,14 @@ class TestVersionCompare:
         assert uc.is_newer("", "0.1.1") is False
         assert uc.is_newer("abc", "0.1.1") is False
 
+    def test_prerelease_suffix_not_concatenated(self):
+        # Regression: '3rc1' must parse as 3, not 31 — a pre-release must
+        # not look newer than its own final release (1.2.3rc1 < 1.2.3).
+        assert uc.is_newer("1.2.3", "1.2.3rc1") is True
+        assert uc.is_newer("1.2.3rc1", "1.2.3") is False
+        assert uc.is_newer("1.2.3rc1", "1.2.3rc1") is False
+        assert uc.is_newer("1.2.10b2", "1.2.9") is True  # suffix ignored
+
 
 class TestNetworkPaths:
     def test_newer_version_returns_banner(self, monkeypatch):

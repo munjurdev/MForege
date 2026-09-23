@@ -169,6 +169,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/bash", "Run a shell command with the agent's safety guards"),
     ("/theme:toggle", "Toggle between light and dark mode"),
     ("/byok", "Show where to configure your API key / model"),
+    ("/feedback", "Share feedback / open an issue"),
     ("/model", "Switch model live (free catalog: Groq, OpenRouter, Ollama)"),
     ("/reasoning", "Set how hard the model thinks (low / high / max)"),
     ("/resume", "Resume a recent chat (default: latest)"),
@@ -444,6 +445,9 @@ class ChatUI:
         # label override (tests); formatted like '· 1h 2m' next to the model.
         self._session_started: float | None = None
         self._session_label: str | None = None
+        # Theme state — initialized here (not lazily in toggle_theme) so any
+        # reader (main.py, /diagnostics, tests) never hits AttributeError.
+        self._dark_theme = True
 
         # Transcript pane (colored fragments, scrollable via PgUp/PgDn
         # and the mouse wheel)
@@ -1035,7 +1039,7 @@ class ChatUI:
 
     def toggle_theme(self) -> None:
         """Swap between dark and light palettes (Ctrl+T unaffected)."""
-        self._dark_theme = not getattr(self, "_dark_theme", True)
+        self._dark_theme = not self._dark_theme
         try:
             self.app.style = Style.from_dict(
                 self._LIGHT_STYLE if not self._dark_theme else self._DARK_STYLE
@@ -1328,7 +1332,14 @@ class ChatUI:
 
     async def _worker(self, handler) -> None:
         """Dispatch loop: run each queued message as a child task so Esc can
-        cancel ONE message mid-flight without killing the worker loop."""
+        cancel ONE message mid-flight without killing the worker loop.
+
+        CancelledError is re-raised ONLY when this worker task itself is
+        being cancelled (app shutdown). A child handler's cancellation —
+        the Esc-stop path — must be swallowed here, or the worker task
+        dies and the app freezes: no message is processed until restart.
+        """
+        me = asyncio.current_task()
         while True:
             text = await self._queue.get()
             handler_task = asyncio.get_event_loop().create_task(handler(text))
@@ -1336,7 +1347,11 @@ class ChatUI:
             try:
                 await handler_task
             except asyncio.CancelledError:
-                raise  # app shutdown — propagate
+                if me is not None and me.cancelling():
+                    raise  # the WORKER was cancelled — real shutdown, propagate
+                # Only the child was cancelled (Esc-stop): the turn ended,
+                # the partial answer was already persisted by the agent's
+                # finally-block. Keep dispatching — the loop must survive.
             except Exception as e:
                 self.append(f"[!] Unexpected error: {e}", style="class:error")
             finally:

@@ -126,6 +126,21 @@ class TestCommandClassification:
                     "mkdir stuff", "django-admin startproject shop"]:
             assert _classify_command(cmd) == "confirm", cmd
 
+    def test_chained_safe_prefix_needs_confirm(self):
+        """Regression: a safe first word with a chained/redirected second
+        command must NOT run unconfirmed (`echo hi && pip install x` used
+        to classify as safe because only the first word was inspected)."""
+        for cmd in ["echo hi && pip install evil", "ls; mkdir stuff",
+                    "cat x | sh", "echo hi > main.py", "whoami & git init",
+                    "pwd || python main.py"]:
+            assert _classify_command(cmd) == "confirm", cmd
+
+    def test_chained_destructive_still_blocked(self):
+        """A safe first word must never launder a blocked second command."""
+        for cmd in ["echo hi && rm -rf /", "ls; del /s C:\\",
+                    "whoami & format C:", "pwd || git push --force"]:
+            assert _classify_command(cmd) == "blocked", cmd
+
 
 class TestRunCommand:
     @pytest.mark.asyncio

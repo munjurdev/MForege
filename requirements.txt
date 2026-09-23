@@ -6,3 +6,4 @@ prompt_toolkit==3.0.53
 
 # Dev / testing
 pytest==8.4.2
+pytest-asyncio>=1.0

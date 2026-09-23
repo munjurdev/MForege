@@ -21,7 +21,7 @@ import getpass
 import os
 import sys
 
-from decouple import config as _cwd_config, Config, RepositoryEnv
+from decouple import config as _env_fallback, Config, RepositoryEnv
 
 # Windows consoles default to cp1252, which cannot encode emojis the model
 # may output. Force UTF-8 (with safe replacement) so printing never crashes.
@@ -37,7 +37,8 @@ from app.tools import ExaSearchTool
 from app.tools.system_tools import create_system_tools, PlanState, NotifyHook
 from app.ui import ChatUI, boxed
 from app import models as model_catalog
-from app.update_check import check_for_update
+from app.update_check import check_for_update, get_available_update
+from app import self_update
 from app.llm.client import (
     LLMClient,
     LLMAuthError,
@@ -54,9 +55,12 @@ def cprint_err(text: str) -> None:
 
 # ── .env resolution ────────────────────────────────────────────────
 # `mforege` can be launched from ANY directory. Settings resolve in order:
+#   0. real environment variables (shell/session)
 #   1. ./.env            (current folder — per-project override)
 #   2. ~/.mforege/.env   (global config written by the setup wizard)
 #   3. <MForege repo>/.env (developer install)
+# Resolution is per-key: a current-folder .env that lacks a key (e.g. a Django
+# project's .env with DEBUG/SECRET_KEY only) must NOT shadow the global config.
 _MFOREGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 try:
     _root_config = Config(RepositoryEnv(os.path.join(_MFOREGE_ROOT, ".env")))
@@ -80,14 +84,29 @@ _load_home_config()
 
 
 def env_config(key: str, default: str = "") -> str:
-    """Read settings: current .env → ~/.mforege/.env → MForege's own .env."""
+    """Read settings: current .env → ~/.mforege/.env → MForege's own .env.
+
+    Falls through **per key**: the first file that actually defines `key`
+    wins. A local .env that doesn't define the key (e.g. a Django project's
+    .env with only DEBUG/SECRET_KEY) must not shadow ~/.mforege/.env.
+    """
     if os.path.exists(".env"):
-        return _cwd_config(key, default=default)
-    if _home_config is not None:
+        # Fresh read per call — picks up edits made after launch (same policy
+        # as _load_home_config()). NOTE: decouple's bare `config` object
+        # resolves its search path via caller-frame magic, so it must NOT be
+        # used here; we build the repository from the real CWD instead.
+        try:
+            local = Config(RepositoryEnv(os.path.join(os.getcwd(), ".env")))
+            if key in local.repository:  # honors os.environ too
+                return local(key, default=default)
+        except Exception:
+            pass  # unreadable local .env → keep falling through
+    if _home_config is not None and key in _home_config.repository:
         return _home_config(key, default=default)
-    if _root_config is not None:
+    if _root_config is not None and key in _root_config.repository:
         return _root_config(key, default=default)
-    return default
+    # Nothing defined it anywhere — one last chance: the real environment.
+    return _env_fallback(key, default=default)
 
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -526,8 +545,8 @@ async def run_plain_cli(agent, args, workspace, plan_state, notify_hook,
             _pc("   → /resume <id> to continue one — /new to start fresh.", COLORS_DIM)
             return
         if low == "queue":
-            _pc("[Queue] Message queueing is not needed — MForege processes")
-            _pc("    each message immediately; send after the reply lands.", COLORS_DIM)
+            _pc("[Queue] Messages sent while the agent works are queued —")
+            _pc("    '✓ Queued' appears, and each runs in order after the current turn.", COLORS_DIM)
             return
         if low == "interview":
             _pc("[Interview] Tell me your goal in one line — I'll ask targeted", "\033[96m")
@@ -652,6 +671,8 @@ Keys go in a .env file in the current folder (API_KEY=..., LLM_BACKEND=custom, B
     parser.add_argument("--plain", action="store_true",
                         help="Classic line-by-line chat (no full-screen UI) — use if the "
                              "fancy input box doesn't accept your keyboard in this terminal")
+    parser.add_argument("--no-update", action="store_true",
+                        help="Skip the automatic self-update check (also: MFOREGE_NO_UPDATE=1)")
     return parser
 
 
@@ -689,6 +710,17 @@ async def main(argv: list[str] | None = None) -> None:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # ── Freebuff-style auto-update ──────────────────────────────────
+    # A newer PyPI release exists (24h-cached, silent when offline) and the
+    # user didn't opt out → print a notice, exit to release the exe lock,
+    # and let a detached helper upgrade + relaunch into the same terminal.
+    if not args.no_update and not self_update.updates_disabled():
+        available = get_available_update(__version__)
+        if available:
+            print(f"[i] New version available: mforege {available} "
+                  f"(you have {__version__})")
+            self_update.perform_update()   # exits; helper relaunches mforege
 
     # Resolve and validate the workspace early (human decides the sandbox root)
     workspace = os.path.abspath(args.workspace)
@@ -748,7 +780,10 @@ async def main(argv: list[str] | None = None) -> None:
     agent.plan_state = plan_state
     notify_hook = NotifyHook()
 
-    search_tool = ExaSearchTool()
+    # Pass the key through OUR env chain (./.env → ~/.mforege/.env → repo .env).
+    # The tool's bare-decouple fallback can't see ~/.mforege/.env, but the
+    # welcome text tells users to put EXA_API_KEY exactly there.
+    search_tool = ExaSearchTool(api_key=env_config("EXA_API_KEY", default=""))
 
     # Register tools BEFORE either UI branch — both modes need them.
     # The plain CLI passes its own async confirm (stdin y/n); the full UI
@@ -858,8 +893,10 @@ async def main(argv: list[str] | None = None) -> None:
                   style="class:ok")
         ui.append("   Context is back — just continue chatting.", style="class:dim")
 
-    # Upgrade banner (24h-cached PyPI check; silent on any failure)
-    update_banner = check_for_update(__version__)
+    # Upgrade banner (24h-cached PyPI check; silent on any failure).
+    # Auto-update already handled it at startup; this banner is the fallback
+    # for users with MFOREGE_NO_UPDATE=1 or after a failed upgrade.
+    update_banner = None if self_update.updates_disabled() else check_for_update(__version__)
     if update_banner:
         ui.append(update_banner, style="class:warn")
 
@@ -949,6 +986,7 @@ async def main(argv: list[str] | None = None) -> None:
         """Freebuff-style commands: /diagnostics /review /copy /export
         /theme:toggle /reasoning /queue /new /history /bash /byok /feedback
         /interview. Keep behavior identical across plain and UI."""
+        nonlocal session  # /new replaces the session object
         slash = user_input.split()[0].lower()
         if slash == "/diagnostics":
             used, window = agent.context_usage()
@@ -1038,8 +1076,8 @@ async def main(argv: list[str] | None = None) -> None:
             refresh_context_meter()
             return
         if slash == "/queue":
-            ui.append("[Queue] Message queueing is not needed — MForege processes", style="class:dim")
-            ui.append("   each message immediately; send after the reply lands.", style="class:dim")
+            ui.append("[Queue] Messages sent while the agent works are queued —", style="class:dim")
+            ui.append("   '✓ Queued' appears, and each runs in order after the current turn.", style="class:dim")
             return
         if slash == "/new":
             agent.clear_memory()
@@ -1216,6 +1254,15 @@ async def main(argv: list[str] | None = None) -> None:
                 ui.begin_reply()
                 reply_text = response
                 ui.stream_reply(response)
+        except (LLMAuthError, LLMConnectionError, LLMRateLimitError,
+                LLMResponseError) as e:
+            # Backend problems already carry a human-friendly message from
+            # the LLM client (key rejected, Ollama down, rate limit, 413…).
+            # Show it cleanly instead of a raw traceback-y repr.
+            reply_text = ""
+            ui.append(f"[!] {e}", style="class:error")
+            ui.append("    (Check /byok for config, or /model to switch models.)",
+                      style="class:dim")
         finally:
             ui.end_reply()        # close the markdown block (final render stays)
             ui.finish_thinking()  # safety: never leave a dangling block

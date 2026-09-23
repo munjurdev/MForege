@@ -511,6 +511,37 @@ class TestEchoSubmission:
         finally:
             worker_task.cancel()
 
+    @pytest.mark.asyncio
+    async def test_worker_survives_esc_stop(self, ui):
+        """Regression: Esc-stop cancels the CHILD handler — the worker loop
+        itself must keep dispatching (it used to re-raise CancelledError
+        and die, freezing the app until restart)."""
+        started = asyncio.Event()
+        processed = []
+
+        async def handler(text):
+            if text == "stuck":
+                started.set()
+                await asyncio.sleep(30)  # in-flight request
+            processed.append(text)
+
+        worker_task = asyncio.get_event_loop().create_task(ui._worker(handler))
+        try:
+            await asyncio.sleep(0.05)
+            ui._queue.put_nowait("stuck")
+            await started.wait()
+            ui.request_stop()  # Esc: cancels ONLY the handler task
+            await asyncio.sleep(0.1)
+            assert processed == []  # first message was aborted
+            ui._queue.put_nowait("after-esc")
+            for _ in range(20):
+                if processed == ["after-esc"]:
+                    break
+                await asyncio.sleep(0.05)
+            assert processed == ["after-esc"]  # worker still alive
+        finally:
+            worker_task.cancel()
+
 
 class TestMarkdownRendering:
     """Assistant replies render as formatted markdown (agent-style output)."""

@@ -117,6 +117,12 @@ SAFE_PREFIXES = (
 )
 
 
+# Shell operators that can smuggle a second command into a 'safe' first
+# word (e.g. `echo hi && rm -rf /` starts with echo → was classified safe).
+# Any of these → the command needs confirmation, period.
+_CHAIN_OPERATORS = ("&&", "||", ";", "|", "&", ">", "<", "`", "$(", "\n")
+
+
 def _classify_command(command: str) -> str:
     """
     Returns one of:
@@ -132,7 +138,12 @@ def _classify_command(command: str) -> str:
 
     first_word = cmd.split(" ", 1)[0] if cmd else ""
     if any(cmd.startswith(p.rstrip()) or cmd.startswith(p) for p in SAFE_PREFIXES):
-        return "safe"
+        # Safe prefix — but a chained/redirected second command would run
+        # unconfirmed (e.g. `echo hi && rm -rf /`). Chain operators force a
+        # confirmation; the blocked-list already refused the destructive ones.
+        if not any(op in cmd for op in _CHAIN_OPERATORS):
+            return "safe"
+        return "confirm"
 
     # python -m pytest / python script.py etc. — confirm (can do anything)
     if first_word in ("python", "python3", "pip", "git", "npm"):
@@ -212,8 +223,13 @@ class ListFilesTool(Tool):
                 hidden = len(entries) - len(lines)
                 break
             full = os.path.join(resolved, name)
-            marker = "/" if os.path.isdir(full) else ""
-            size = "" if marker else f"  ({os.path.getsize(full)} bytes)"
+            try:
+                marker = "/" if os.path.isdir(full) else ""
+                size = "" if marker else f"  ({os.path.getsize(full)} bytes)"
+            except OSError:
+                # File vanished / unreadable between listdir and stat —
+                # list the name without metadata instead of failing.
+                marker, size = "", ""
             lines.append(f"{name}{marker}{size}")
 
         header = f"Contents of {path}:" if path != "." else "Contents of project root:"

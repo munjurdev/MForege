@@ -1,11 +1,11 @@
 """
 Session Persistence
 ===================
-Saves each conversation as a JSON file under <project root>/data/sessions/
+Saves each conversation as a JSON file under ~/.mforege/sessions/
 so any chat can be resumed after a restart — like an agent session sidebar.
 
 Design:
-- One file per session: data/sessions/<timestamp>_<snippet>.json
+- One file per session: ~/.mforege/sessions/<timestamp>_<snippet>.json
 - Each file: {"id", "started", "last_active", "title", "messages":[...]}
 - Messages stored in OpenAI format (role/content) — exactly what the model
   needs to continue seamlessly.
@@ -18,6 +18,8 @@ Usage:
     session.append(user_msg, reply_msg)     # after each exchange
     store.list()                            # for /sessions (sidebar listing)
     store.load(session_id)                  # returns messages for resume
+
+(The directory can be overridden per-instance for tests: SessionStore(directory=...).)
 """
 
 import json
@@ -28,10 +30,16 @@ from typing import List, Dict, Optional
 
 
 def _sessions_dir() -> str:
-    project_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    return os.path.join(project_root, "data", "sessions")
+    """Sessions live in ~/.mforege/sessions — NOT inside the package.
+
+    A pip-installed copy sits in site-packages, so a package-relative dir
+    would (a) scatter per-project chats into the Python installation and
+    (b) get WIPED by `pip install --upgrade` (site-packages is replaced).
+    The user-level config dir survives upgrades and is shared by every
+    project folder, matching how ~/.mforege/.env stores settings.
+    """
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".mforege", "sessions")
 
 
 class StoredSession:
@@ -129,8 +137,13 @@ class SessionStore:
                 if first_user:
                     text = " ".join(first_user["content"].split())
                     session.title = text[:48] + ("…" if len(text) > 48 else "")
-            with open(self._path(session.id), "w", encoding="utf-8") as f:
+            # Atomic write: a crash/power-cut mid-write must not corrupt
+            # the session file (a half-written JSON would fail to load on
+            # resume). Write to a temp file, then replace in one step.
+            tmp = self._path(session.id) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._path(session.id))
             self._prune()
             return True
         except Exception:

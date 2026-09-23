@@ -24,14 +24,29 @@ TIMEOUT = 3.0
 
 
 def _parse_version(version: str) -> tuple:
-    """'1.2.10' -> (1, 2, 10). Non-numeric parts are dropped for safety."""
+    """'1.2.10' -> (1, 2, 10, 1). Non-numeric parts are dropped for safety.
+
+    A non-numeric suffix (e.g. '1.2.3rc1', '1.2.10b2') ends that numeric
+    piece — '3rc1' parses as 3, NOT 31 — and marks the version as a
+    pre-release with a trailing 0 flag, so a pre-release sorts BELOW its
+    own final release: 1.2.3rc1 < 1.2.3, but 1.2.3rc1 == 1.2.3rc1.
+    """
     parts = []
+    clean = 1
     for piece in (version or "").strip().split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            elif digits:
+                clean = 0  # pre-release suffix (rc1, b2, …) on this piece
+                break
         if not digits:
             break
         parts.append(int(digits))
-    return tuple(parts) if parts else (0,)
+    if not parts:
+        return (0, 1)
+    return tuple(parts) + (clean,)
 
 
 def is_newer(remote: str, local: str) -> bool:
@@ -67,20 +82,38 @@ def check_for_update(local_version: str, force: bool = False) -> "str | None":
     Return an upgrade banner string if PyPI has a newer version, else None.
     Never raises; never blocks longer than TIMEOUT seconds.
     """
-    if not local_version:
+    remote = get_available_update(local_version, force=force)
+    if not remote:
         return None
+    return _banner(remote)
 
-    # Respect the 24h cache unless explicitly forced
+
+def get_available_update(local_version: str, force: bool = False) -> str:
+    """Return the newer remote version string, or '' when up to date.
+
+    Same network guarantees as check_for_update (cached 24h, silent on any
+    failure) but returns data instead of a banner so the auto-updater can
+    act on it. The cache records `latest`, so a cached "up to date" answer
+    is answered locally without touching the network again.
+    """
+    if not local_version:
+        return ""
+
     if not force:
         cache = _read_cache()
         checked_at = cache.get("checked_at", 0)
-        now = os.path.getmtime(CACHE_PATH) if os.path.exists(CACHE_PATH) else 0
+        try:
+            now = os.path.getmtime(CACHE_PATH)
+        except OSError:
+            now = 0  # vanished between exists() and getmtime — treat as stale
         import time
         if now and (time.time() - now) < CACHE_TTL_SECONDS and checked_at:
             remote = cache.get("latest")
             if remote and is_newer(str(remote), local_version):
-                return _banner(str(remote))
-            return None
+                return str(remote)
+            if remote:
+                return ""  # cache says we're current
+            return ""     # no usable info — fall through to network
 
     try:
         req = urllib.request.Request(CHECK_URL, headers={"User-Agent": f"mforege/{local_version}"})
@@ -88,15 +121,15 @@ def check_for_update(local_version: str, force: bool = False) -> "str | None":
             data = json.load(resp)
         remote = str((data.get("info") or {}).get("version") or "")
     except Exception:
-        return None  # offline, PyPI down, malformed response — stay silent
+        return ""  # offline, PyPI down, malformed response — stay silent
     if not remote:
-        return None
+        return ""
 
     _write_cache({"latest": remote, "checked_at": 1})
 
     if is_newer(remote, local_version):
-        return _banner(remote)
-    return None
+        return remote
+    return ""
 
 
 def _banner(remote: str) -> str:
